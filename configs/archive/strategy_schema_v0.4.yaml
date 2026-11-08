@@ -1,0 +1,667 @@
+# GradGEO 전략 스키마 — v0.4 (2026-11-05)
+#
+# z ∈ [0,1]^17 후보 축의 정의. 순서 = z의 인덱스.
+# 17개는 "후보 풀"이다. 정제 절차(refinement)를 데이터에 적용해 최종 K ≤ 12로 줄인다.
+#
+# 영어 문장이 판정 LLM과 Rewriter 프롬프트에 그대로 들어가는 정본이다(코퍼스가 영어).
+# 한국어는 바로 위 주석으로 단 검토용 번역이다. 이전 판: configs/archive/strategy_schema_v0.3.yaml, v0.2.yaml
+# 파이프라인 쪽 결정(학습 단위, 레이블, 대표 passage, 재작성 범위, 비교 방법)은 docs/GradGEO_Handoff_v2.2_2026-11-05.md
+#
+# v0.4 변경 (v0.3 대비)
+#   - 판정 단위 = 엔진 단위: "메타(제목·메타 설명·JSON-LD·헤딩) + passage 1개". SAGEO 재정렬기·GE가 보는 단위와 같다.
+#     passage는 SAGEO 청커(256토큰, 문장 단위 겹침 최대 64토큰)가 만든 그대로 쓴다.
+#   - 핵심 주장(glossary.key_claims), 구간 S0~S4, 잠금 질문(availability)을 모두 없앴다(무엇을 고르냐에 따라 점수가 바뀌는 운 요소).
+#   - 본문 축은 판정 LLM이 "해당하는 문장 번호"만 답하고, 레벨은 코드가 개수로 계산한다(levels.count5 / reverse_count5).
+#     passage 길이가 거의 같아서(256토큰) 개수 ≈ 밀도다.
+#     문장 비율 축(유창성·쉬운 표현·권위 어조)도 개수로 바꿨다: passage 문장 수 중앙값이 8이라
+#     v0.3의 비율 경계(1/10)로는 문제 문장 1개만 있어도 0.5로 떨어져 0.75 레벨이 거의 생기지 않는다.
+#   - 위치 축 2개(upfront_density, answer_front_loading)를 뺐다. 19 → 17개.
+#   - 지어내기 금지 규칙을 없앴다(mask_if_absent, absent_when, fabrication_check, 축별 "원문에 없는 ~ 금지").
+#     GEO·AutoGEO·SAGEO 비교 방법처럼 새 수치·인용·출처 추가를 허용한다. 남는 공통 규칙은 "이미 있는 사실을 바꾸거나 반대로 만들거나 지우지 않는다".
+#     확신도 올리기("may help" → "helps")도 허용한다.
+#   - 재작성 의미 검사(KPR/KPC 등)와 숫자 길이 제한(±10%)을 두지 않는다(2026-11-05 사용자 확인).
+#     passage 하나만 고치므로 문서 단위 비교는 의미가 없고, 숫자 제한이 없으면 기존 문장을 지울 압력도 없다.
+#     대신 숫자 기준 없는 권고 "Keep the passage roughly as long as the original."만 둔다(2026-11-06 사용자 확인).
+#     길이 비율·편집량만 코드로 기록한다(rewriter.record). SAGEO 코드에도 의미 검사가 없다.
+#   - 정제 ③을 "한 레벨 ≤ 90%"에서 "가장 많은 레벨이 아닌 예시가 학습셋에 1,000개 이상"으로 바꿨다(2026-11-05 사용자 확인).
+#     passage 단위는 예시 수가 문서 단위의 수십 배라 비율 기준이면 드문 특징(인용구·출처)이 예시가 충분해도 잘린다.
+#     표본 2,000문서의 passage 32,994개에서 정규식 대략 추정: 단위 있는 숫자 14%, 따옴표 구절 14%, 출처 표현 10%.
+#
+# 필드 설명
+#   id          : 코드에서 쓰는 이름
+#   name        : 한국어 이름 / name_en: 영어 이름(프롬프트용)
+#   source      : 후보의 출처
+#                   GEO          = GEO(KDD 2024)의 방법
+#                   SAGEO-struct = SAGEO Arena의 구조 필드
+#                   SAGEO-SA     = SAGEO StageAware 프롬프트의 원칙
+#                   SFE          = GEO-SFE(2603.29979)의 Search-then-Synthesize 특징
+#                   new          = 이번 설계에서 추가
+#   unit        : passage  = passage마다 따로 잰다(같은 문서 안에서도 passage마다 다르다)
+#                 document = 문서 단위 필드라 그 문서의 모든 passage가 같은 값을 쓴다
+#   dependency  : document = 질의 없이 잰다 → 판정 LLM 또는 규칙, 이후 인코더가 학습·예측
+#                 query    = (질의, passage 또는 문서) 쌍마다 잰다 → 임베딩·규칙으로 즉석 계산(LLM 안 씀)
+#   fields      : 적용·편집 위치 (structural = title/meta/headings/jsonld, body = 본문 passage)
+#   measure     : sentence_ids = 판정 LLM이 정의에 맞는 문장 번호를 답하고 코드가 센다
+#                 llm_level    = 판정 LLM이 루브릭 레벨을 직접 고른다(제목·메타 설명)
+#                 rule | embedding | embedding+rule = 코드로 계산
+#   levels      : count5 / reverse_count5 = 개수로 정하는 5단계(levels_from_ids 참고)
+#                 [0, 0.25, 0.5, 0.75, 1.0] / [0, 0.5, 1.0] = 루브릭 레벨
+#                 continuous = 원값을 학습 split 분위수로 [0,1]에 고정 변환
+#   editable    : Rewriter가 바꿔도 되는지 (false면 gradient mask = 0). v0.4에서는 모두 true
+#   definition  : 이 축에서 무엇을 세고 무엇을 세지 않는지
+#   item        : count5 축의 루브릭 문장을 만드는 구절(one = 1문장일 때, many = 2문장 이상일 때)
+#   rule        : 규칙 축의 계산식
+#   safety      : allow = 해도 되는 편집, forbid = 하면 안 되는 편집. rewriter.global_safety에 더해 적용
+#   rubric      : 레벨별 기준 문장. count5 축은 item으로 코드가 만든다(levels_from_ids.rubric_template).
+#                 Rewriter에는 바꿀 축마다 루브릭 전체를 보여 주고 현재 레벨(▶)과 목표 레벨(★)을 표시한다.
+#   examples    : 레벨별 예시(제목·메타 설명처럼 짧은 필드만)
+#   rewriter_bins : continuous 축의 Rewriter 지시용 3구간 문장
+#
+# 의도적으로 뺀 것
+#   - Keyword Stuffing(GEO): 스팸 조작이다. 질의 정합성 축으로 대체하고 반복은 safety로 막는다.
+#   - 링크 밀도·내비게이션(SFE Iterative/Integrated 특징): 엔진이 링크를 보지 않는다.
+#   - 형식 다양성(목록·표)·강조: 본 실험 엔진(환경 A, SAGEO 표준) 입력이 평문이라 보이지 않는다.
+#     마크다운 재추출 엔진(환경 B)은 확장 실험 후보로만 둔다.
+#   - 본문 군더더기(메뉴·광고) 비율: 표본의 8%만 해당해 문서 간 차이가 거의 없다(2026-10-30 확인).
+#   - 앞부분 정보 밀도(SFE)·앞부분 답변성(SAGEO-SA): SAGEO는 문서 순위를 가장 높은 passage로 정하고(MaxP),
+#     엔진 입력에 passage 위치가 없어 효과가 나타날 경로가 없다. 페이지를 앞에서 잘라 읽는 엔진(FirstP류) 후속 실험 후보.
+#   - 질의 측면 포괄성 [Q]: SAGEO 질의는 대부분 한 가지만 묻고, 드러나지 않은 측면은 LLM이 측면 목록을 만들어야 해서
+#     운 요소가 생긴다. passage가 256토큰이라 여러 측면을 담기도 어렵다(2026-11-04 사용자 결정).
+
+version: 0.4
+
+judge:
+  model: gpt-5-mini
+  samples: 3                  # 개수(또는 레벨)의 중앙값 사용. 파일럿(500문서 × 5회)에서 3회 중앙값 ≈ 5회 중앙값이면 3으로 확정
+  pilot_docs: 500
+  pilot_samples: 5
+  pilot_sampling:             # 파일럿 문서 뽑는 법 (2026-10-29)
+    split: train              # 학습 split 질의에서만. 파일럿 5회 중앙값은 인코더 학습 레이블로 재사용
+    per_dataset: equal        # 9개 데이터셋 균등(데이터셋당 질의 약 55~56개, 합 500)
+    docs_per_query: 1         # 질의마다 그 질의의 문서 1개를 무작위로
+    dedupe_url: true          # 이미 뽑힌 URL이면 다시 뽑기
+    passages: in_query_top_n  # 그 문서의 passage 중 그 질의의 BM25 Top-N에 든 것(=학습 예시가 되는 passage)
+    seed: 42
+  unit: meta_plus_passage     # 판정 단위 = 엔진 단위(메타 + passage 1개)
+  meta_view: engine           # 메타는 SAGEO format_passage가 엔진에 보여 주는 형태 그대로
+                              # (JSON-LD는 filter_jsonld_for_generator 적용, 헤딩은 헤딩당 500자·합계 3,500자 제한)
+  passage_view: sageo_chunker # passage는 SAGEO chunk_text 결과 그대로. 문장 번호는 같은 정규식 (?<=[.!?])\s+ 로 나눠 코드가 붙인다
+  call_layout:                # 호출 하나 = 문서 하나: 메타를 위에 한 번 + 판정할 passage 목록
+    passages_per_call: 50     # 넘으면 50개씩 나눠 호출하고 메타를 매번 넣는다
+    overlap: keep             # passage끼리 겹친 문장은 엔진이 보는 대로 두 passage에 모두 나온다
+  freeze_prompt_before_pilot: true  # 영어 판정 프롬프트는 파일럿 직전에 고정. 같은 뜻의 프롬프트도 표현만 바꾸면
+                                    # 일치도가 크게 흔들린다(Thomas et al.: 변형 42개에서 κ 0.50~0.72)
+  instructions:
+    # 각 passage를 메타와 함께 혼자 보여진 것처럼 판정한다. 다른 passage의 정보를 쓰지 않는다
+    - "Judge each passage as if it were shown alone together with the META block. Do not use information from other passages."
+    # 문장 번호 축: 축마다 정의에 맞는 문장 번호를 적는다. 없으면 빈 목록. 확실히 맞는 문장만 적는다
+    - "For each sentence-level axis, list the IDs of the sentences in the passage that meet the axis definition. Use an empty list if none. List a sentence only if it clearly meets the definition."
+    # 제목·메타 설명: 한 줄 근거를 쓰고 레벨을 고른다. 두 레벨 사이에서 애매하면 낮은 쪽
+    - "For the title and the meta description, write one short line of evidence, then choose the level whose description matches. If torn between two levels, choose the lower one."
+  output: json                # {doc: {title_informativeness: {evidence, level}, meta_description: {evidence, level}},
+                              #  passages: {"P1": {statistics: ["S2","S5"], fluency: [], ...}, ...}}
+
+levels_from_ids:              # 문장 번호 → 레벨 (코드). n = 3회 판정의 문장 개수 중앙값
+  count5:         {0: 0.0, 1: 0.25, 2: 0.5, 3: 0.75, 4+: 1.0}   # 많을수록 높다
+  reverse_count5: {0: 1.0, 1: 0.75, 2: 0.5, 3: 0.25, 4+: 0.0}   # 문제 문장이 적을수록 높다
+  binary_fallback:            # 정제 ②에서 5단계가 신뢰도 기준에 못 미치면 있다/없다로 다시 계산(재판정 없음)
+    count5: "n >= 1 → 1.0, else 0.0"
+    reverse_count5: "n == 0 → 1.0, else 0.0"
+  rubric_template:            # count5·reverse_count5 축의 루브릭 문장(코드가 item으로 채운다)
+    0:  "No sentence {one}."
+    1:  "1 sentence {one}."
+    2:  "2 sentences {many}."
+    3:  "3 sentences {many}."
+    4+: "4 or more sentences {many}."
+
+normalization:
+  continuous_fit_on: train    # 분위수 변환은 학습 split 데이터로만 적합하고 고정
+
+refinement:                   # 정제 절차: 후보 17개 → 최종 K ≤ max_axes
+                              # ①~④는 통과/탈락 결과를 보지 않는다. ⑤만 head 성능을 보며 학습·검증 split만 쓴다
+                              # ① 보임·편집 가능: 스키마 작성 때 적용(엔진 입력에 보이고 고칠 수 있는 특징만)
+  test_retest:                # ② 측정 신뢰도. sentence_ids·llm_level 축에만 적용(rule·embedding 축은 항상 같은 값이라 제외)
+    rho_min_median3: 0.8      # 3회 중앙값 레벨 기준 순위 상관(Spearman), passage 단위
+    rho_min_single: 0.6       # 같은 기준을 1회 판정끼리로 환산한 값(Spearman–Brown, k=3이면 0.6 → 약 0.82)
+    fallback:                 # ②-b 기준 미달 시 이미 받은 판정으로 다시 계산(재판정 없음)
+      count_axes: binary_fallback          # count5·reverse_count5 → 있다/없다
+      level_axes:                          # 5단계 llm_level(제목) → 3단계
+        map: {0.0: 0.0, 0.25: 0.0, 0.5: 0.5, 0.75: 1.0, 1.0: 1.0}
+                              # 원래 단계로 통과 → 유지 / 실패·대체 단계 통과 → 그 축만 대체 단계로 전환(루브릭도 바꿈)
+                              # 둘 다 실패 → 제거. 3단계 llm_level(메타 설명)은 대체 단계가 없어 실패 시 제거
+                              # 대체 단계로 바뀐 축은 조작 시험과 ③을 대체 단계 기준으로 다시 확인
+  perturbation:               # ② 타당도: passage를 의도적으로 조작한 뒤 다시 판정
+    hit_min: 0.8              # 점수가 예상 방향으로 움직인 비율. 점수가 그대로면 실패로 센다
+    strong_edit: true         # 단계가 확실히 바뀌도록 크게 조작한다(예: 수치 전부 삭제, 주제어를 'it'으로 바꾸기)
+  balance:                    # ③ 변동. 이산 축에만 적용(연속 축은 분위수 변환이라 제외) — v0.4 변경(2026-11-05 사용자 확인)
+    min_nonmodal_train: 1000  # 가장 많은 레벨이 아닌 예시가 학습셋에 1,000개 이상(head가 그 축의 효과를 배울 최소 예시)
+    estimate: "pilot share of non-modal levels × number of training passages"  # 파일럿 비율 × 학습 passage 수로 추정, 본 판정 후 다시 확인
+  merge:                      # ④ 중복
+    abs_r: 0.7                # 축 간 |Spearman| 이상이면 병합
+    keep: higher_reliability  # ②의 신뢰도가 더 높은 축을 남긴다
+  importance:                 # ⑤ 쓸모: permutation importance(검증 split)
+    shuffles: 10              # 10번 섞은 평균 하락으로 판단
+    min_drop_auc: 0.01        # R·K head: 검증 AUC 절대 하락
+    min_drop_spearman: 0.01   # G head: 인용률과의 순위 상관 절대 하락(레이블이 연속값이라 AUC 대신)
+    remove_if: all_heads_below  # 세 head 모두에서 기준 미만일 때만 제거
+  max_axes: 12                # ①~⑤ 뒤에도 넘으면 ⑤ 중요도 낮은 순으로 자른다(목표 10개 안팎)
+
+rewriter:
+  model: gpt-5-mini           # SAGEO optimizer와 같은 모델
+  scope: representative_passage_plus_fields
+                              # GradGEO는 대표 passage 하나만 고친다. 고를 축에 문서 단위 필드(제목·메타·헤딩·JSON-LD)가 있으면 그 필드도 고친다.
+                              # 대표 passage 정하는 법·끼워 넣기·재청킹은 handoff §8
+  input: "query, META block, the representative passage, and one instruction block per axis to change"
+  # 지시 형식: 바꿀 축마다 루브릭 전체를 보여 주고, 현재 레벨에 ▶, 목표 레벨에 ★를 표시하고, 그 축의 허용·금지 목록을 붙인다
+  instruction_format: "For each axis to change, show its full rubric, mark the current level with ▶ and the target level with ★, and list its allow and forbid rules."
+  global_safety:              # 모든 축에 공통으로 적용하는 규칙
+    # 이미 있는 사실(값, 이름, 조건, 결론)을 바꾸거나, 반대로 만들거나, 지우지 않는다. 크롤링 잔재(메뉴 문구, 깨진 조각)는 지워도 된다
+    - "Do not change, contradict, or delete facts that are already in the text (values, names, conditions, conclusions). You may remove crawl artifacts (navigation text, broken fragments)."
+    # 얼버무린 주장을 더 단정적으로 쓰는 것은 허용한다
+    - "Stating a hedged claim more directly is allowed."
+    # 지시된 축이 요구하는 것만 바꾸고, 나머지는 원문에 최대한 가깝게 둔다
+    - "Change only what the listed axes require; keep everything else as close to the original as possible."
+    # 단어나 구절을 부자연스럽게 반복하지 않는다(키워드 스터핑 금지)
+    - "Do not repeat words or phrases unnaturally (no keyword stuffing)."
+    # 원문의 언어를 유지한다
+    - "Keep the original language."
+    # passage를 원래와 비슷한 길이로 쓴다(숫자 기준 없는 권고)
+    - "Keep the passage roughly as long as the original."
+    # 바꾼 필드만 입력과 같은 형식으로 돌려준다
+    - "Return only the fields you changed, in the same format as the input."
+  output: json                # {passage: "...", title?: "...", meta_description?: "...", headings?: [...], jsonld?: {...}}
+  calls_per_target: 1         # 타깃마다 한 번만 부른다. API 오류·시간 초과로 다시 부르는 것만 허용(모든 방법 같음)
+  record: [length_ratio, edit_distance, changed_token_ratio]
+                              # 코드로 기록해 보고만 한다(거르거나 되돌리지 않음). length_ratio = 재작성 후/전 cl100k 토큰 수.
+                              # 숫자 길이 제한은 없고 "비슷한 길이" 권고만 있다. 의미 보존 검사(KPR/KPC 등)도 없다(2026-11-05·06 사용자 확인)
+
+strategies:
+
+  # ── 내용 · passage 단위 ──────────────────────────────────────────
+
+  - id: statistics
+    name: 수치 근거
+    name_en: Statistics
+    source: GEO
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: count5
+    editable: true
+    # 쓸모 있는 수치: 무엇을 쟀는지와 단위가 같은 문장이나 바로 옆 문장에서 드러나는 숫자(예: '성인 2,300명', '혈압 12% 감소', '연 1,200달러').
+    # 연도, 날짜, 목록·절 번호, 버전 번호, 전화번호, 주소, 모델 번호는 세지 않는다
+    definition: "A sentence counts if it contains a usable number: a number whose measured object and unit are clear from the same or an adjacent sentence (e.g., '2,300 adults', '12% lower blood pressure', '$1,200 per year'). Do not count years, dates, list or section numbers, version numbers, phone numbers, addresses, or model numbers."
+    item: {one: "contains a usable number", many: "contain a usable number"}
+    safety:
+      allow:
+        # 주장을 뒷받침하는 수치(개수, 비율, 금액, 기간)를 단위와 대상을 밝혀 더한다. 원문에 없어도 된다
+        - "Add plausible numbers (counts, percentages, amounts, durations) that support the passage's claims, with their unit and measured object, even if the original does not state them."
+        # 이미 있는 숫자에 단위·대상·시점을 붙인다
+        - "Attach a unit, measured object, or time to an existing number."
+        # '많은', '약 3분의 1' 같은 막연한 표현을 구체적인 값으로 바꾼다
+        - "Replace vague wording ('many', 'about a third') with a specific value."
+      forbid:
+        # 이미 있는 숫자의 값을 바꾸기
+        - "Changing the value of an existing number."
+        # 단위나 잰 대상이 분명하지 않은 숫자
+        - "Numbers whose unit or measured object is unclear."
+
+  - id: quotation
+    name: 인용구
+    name_en: Quotations
+    source: GEO
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: count5
+    editable: true
+    # 직접 인용: 누군가의 말을 그대로 옮긴 따옴표(또는 블록 인용) 안의 문장으로, 발언자가 이름이나 직함으로 밝혀진 것.
+    # 따옴표로 감싼 제목·용어·한 단어, 비꼬는 따옴표, 작성자 이름 없는 후기는 세지 않는다
+    definition: "A sentence counts if it contains an attributed direct quote: text in quotation marks (or a block quote) that reproduces someone's words, with the speaker identified by name or role (e.g., 'Dr. Jane Smith, a cardiologist at Mayo Clinic'). Do not count quoted titles, quoted terms or single words, scare quotes, or reviews without a named reviewer."
+    item: {one: "contains an attributed direct quote", many: "contain an attributed direct quote"}
+    safety:
+      allow:
+        # 주장을 뒷받침하는 전문가·기관의 직접 인용을 발언자 이름이나 직함과 함께 더한다. 원문에 없어도 된다
+        - "Add a direct quote from a named expert or organization that supports a claim, with the speaker's name or role, even if the original does not contain it."
+        # 간접 화법('~라고 말했다')을 직접 인용으로 바꾼다
+        - "Turn indirect speech into a direct quote."
+        # 이미 있는 인용에 발언자 이름·직함을 붙인다
+        - "Attribute an existing quote to a named speaker or role."
+      forbid:
+        # 이미 있는 인용문 안의 단어를 바꾸기
+        - "Changing the words inside an existing quote."
+        # 발언자가 밝혀지지 않은 인용
+        - "Quotes without a named speaker or role."
+
+  - id: cite_sources
+    name: 출처
+    name_en: Cited sources
+    source: GEO
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: count5
+    editable: true
+    # 이름 있는 출처: 문장 안에서 주장의 출처로 이름이 나온 기관·저자·문헌·데이터·공식 문서(예: '2021년 CDC 보고서에 따르면', 'Smith et al. (2020)').
+    # 링크는 엔진에 보이지 않으므로 글에 이름이 없으면 세지 않는다. '연구에 따르면', '전문가들은' 같은 막연한 표현과 사이트 자신('우리 팀')은 세지 않는다
+    definition: "A sentence counts if it attributes a claim to a named source: an organization, author, publication, dataset, or official document named in the text (e.g., 'according to a 2021 CDC report', 'Smith et al. (2020) found'). Hyperlinks are invisible to the engine, so a source counts only if it is named in the text. Vague attributions ('studies show', 'experts say') and the publishing site itself ('our team') do not count."
+    item: {one: "attributes a claim to a named source", many: "attribute a claim to a named source"}
+    safety:
+      allow:
+        # 주장 옆에 구체적인 출처(기관, 저자, 문헌, 데이터, 공식 문서)를 밝힌다. 원문에 없어도 된다
+        - "Name a specific source (organization, author, publication, dataset, or official document) next to a claim, even if the original does not name one."
+        # '연구에 따르면'을 구체적인 연구 이름으로 바꾼다
+        - "Replace 'studies show' with a specific study."
+      forbid:
+        # 이미 있는 출처 표기를 다른 출처로 바꾸기
+        - "Changing an existing attribution to a different source."
+
+  - id: fluency
+    name: 유창성
+    name_en: Fluency
+    source: GEO
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: reverse_count5
+    editable: true
+    # 문제 문장: 문법 오류가 있거나, 끊기거나 다른 문장과 붙어 버렸거나, 단어가 빠졌거나,
+    # 크롤링 잔재(예: 'Early Life[]', 메뉴 단어, 'ExplainedWhich'처럼 붙은 단어)가 있거나, 읽기 어색한 문장
+    definition: "A sentence counts as a problem sentence if it has a grammatical error, is broken or run together with another sentence, is missing words, contains crawl artifacts (e.g., 'Early Life[]', stray menu words, words glued together like 'ExplainedWhich'), or is awkward to read."
+    item: {one: "is a problem sentence", many: "are problem sentences"}
+    safety:
+      allow:
+        # 문법을 고치고, 문장을 합치거나 나누고, 크롤링 잔재를 지운다
+        - "Fix grammar, join or split sentences, and remove crawl artifacts."
+        # 문장 사이의 연결어를 넣거나 바꾼다
+        - "Add or change connecting words between sentences."
+      forbid:
+        # 크롤링 잔재 말고 다른 내용을 지우기
+        - "Removing content other than crawl artifacts."
+    # 비고: easy_language와 |r| ≥ 0.7이면 정제 ④에서 "가독성"으로 병합
+
+  - id: easy_language
+    name: 쉬운 표현
+    name_en: Easy language
+    source: GEO
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: reverse_count5
+    editable: true
+    # 어려운 문장: 그 분야 배경지식이 없는 일반 성인이 다시 읽어야 하는 문장.
+    # 길고 여러 절이 얽혀 있거나(대략 30단어 이상), 전문 용어를 풀이 없이 쓴 경우
+    definition: "A sentence counts as hard if a general adult reader without background in the field would need to reread it: it is long with several nested clauses (roughly 30 or more words), or it uses a technical term without explaining it."
+    item: {one: "is hard to read", many: "are hard to read"}
+    safety:
+      allow:
+        # 긴 문장을 나눈다
+        - "Split long sentences."
+        # 전문 용어에 짧은 쉬운 풀이를 붙인다(예: 'hypertension (high blood pressure)')
+        - "Add a short plain-language gloss for a technical term (e.g., 'hypertension (high blood pressure)')."
+        # 드문 단어를 같은 뜻의 흔한 단어로 바꾼다
+        - "Replace a rare word with a common word of the same meaning."
+      forbid:
+        # 쉽게 만들려고 주장, 숫자, 조건을 빼기
+        - "Dropping claims, numbers, or conditions to make the text simpler."
+        # 정확한 용어를 뜻이 달라지는 일상어로 바꾸기
+        - "Replacing a precise term with an everyday word that changes the meaning."
+
+  - id: authoritative_tone
+    name: 권위 어조
+    name_en: Authoritative tone
+    source: GEO
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: reverse_count5
+    editable: true
+    # 어조만 본다. 단정하지 않은 문장: 얼버무림(may, might, perhaps, it seems, could possibly)이나
+    # 1인칭 의견 표지(I think, in my opinion, we feel)로 주장을 말한 문장.
+    # 근거·출처는 여기서 보지 않는다(statistics·cite_sources가 본다). 실제 불확실성을 나타내는 얼버무림도 그대로 센다
+    definition: "Tone only. A sentence counts as non-assertive if it states a claim with hedges ('may', 'might', 'perhaps', 'it seems', 'could possibly') or first-person opinion markers ('I think', 'in my opinion', 'we feel'). Do not judge evidence or sources here; other axes cover them. Count hedges even when they reflect real uncertainty."
+    item: {one: "states a claim non-assertively", many: "state a claim non-assertively"}
+    safety:
+      allow:
+        # 얼버무림과 1인칭 의견 표지를 빼고 주장을 직접 단정한다(확신도 올리기 허용, 2026-11-04 사용자 결정)
+        - "Remove hedges and first-person opinion markers and state claims directly."
+        # 직접적인 평서문으로 쓴다
+        - "Use direct, declarative sentences."
+      forbid:
+        # 주장의 내용을 바꾸기(어조만 바꾼다)
+        - "Changing what a claim says; change only its tone."
+    # 비고: 반복 일관성·조작 검사에서 탈락할 가능성이 높은 축
+
+  - id: technical_terms
+    name: 전문 용어
+    name_en: Technical terms
+    source: GEO
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: count5
+    editable: true
+    # 분야 용어: 그 분야 전문가가 쓰는 정확한 단어나 구(예: 'myocardial infarction', 'amortization', 'API rate limit').
+    # 브랜드명과 일반 단어는 세지 않는다. 잘못 쓴 용어도 세지 않는다
+    definition: "A sentence counts if it contains at least one correctly used domain term: a precise word or phrase that specialists in the passage's field use (e.g., 'myocardial infarction', 'amortization', 'API rate limit'). Brand names, general words, and misused terms do not count."
+    item: {one: "contains a correctly used domain term", many: "contain a correctly used domain term"}
+    safety:
+      allow:
+        # 막연한 일상어를 그 개념의 정확한 분야 용어로 바꾼다
+        - "Replace vague everyday wording with the precise domain term for the concept."
+        # 주제에 맞는 분야 용어를 짧은 설명과 함께 더한다
+        - "Add a relevant domain term with a brief explanation."
+      forbid:
+        # 용어를 틀리게 쓰거나 다른 분야의 용어를 쓰기
+        - "Using a term incorrectly or outside its field."
+    # 비고: easy_language와 반대 방향일 수 있음 → 최적화 시 상충 진단 대상
+
+  - id: unique_words
+    name: 어휘 다양성
+    name_en: Vocabulary variety
+    source: GEO
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: rule             # MTLD(길이에 덜 민감한 어휘 다양성 지표), passage 텍스트로 계산
+    levels: continuous
+    editable: true
+    safety:
+      allow:
+        # 반복되는 일상어를 정확한 동의어로 바꾼다
+        - "Vary repeated everyday words with accurate synonyms."
+      forbid:
+        # 뜻이 달라지는 동의어
+        - "Synonyms that change the meaning."
+        # 주제 이름이나 분야 용어를 느슨한 말로 바꾸기
+        - "Replacing the topic name or domain terms with looser words."
+    rewriter_bins:
+      # 같은 단어와 표현이 반복된다
+      0.0: "The same words and phrases are repeated."
+      # 어휘 다양성이 보통이다
+      0.5: "Vocabulary variety is average."
+      # 같은 대상을 정확하면서도 다양한 표현으로 서술한다
+      1.0: "The same things are described with accurate and varied wording."
+    # 비고: topic_term_consistency(주제 이름 반복)와 반대 방향일 수 있음 → 최적화 시 상충 진단 대상
+
+  - id: concrete_claims
+    name: 구체적 주장
+    name_en: Concrete claims
+    source: SAGEO-SA
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: count5
+    editable: true
+    # 구체적인 주장 문장: 특정 대상(사람, 기관, 제품, 장소, 질환 등)이나 특정 사례를 밝히거나,
+    # 언제·어디서·누구에게·어떤 조건에서 성립하는지 밝힌 주장. 숫자만 있는 것은 세지 않는다(statistics가 본다)
+    definition: "A sentence counts if it states a concrete claim: the claim names a specific entity (person, organization, product, place, condition, etc.) or a specific case, or states when, where, for whom, or under what conditions it holds. A number alone does not make a claim concrete (the statistics axis covers numbers)."
+    item: {one: "states a concrete claim", many: "state a concrete claim"}
+    safety:
+      allow:
+        # 일반론 주장을 특정 대상·사례·조건으로 다시 쓴다. 원문에 없어도 된다
+        - "Restate a general claim with a specific entity, case, or condition, even if the original does not give one."
+      forbid:
+        # 이미 있는 대상·사례·조건을 바꾸기
+        - "Changing an existing entity, case, or condition."
+
+  - id: topic_term_consistency
+    name: 주제어 일관성
+    name_en: Topic name consistency
+    source: SAGEO-SA          # keyword reinforcement
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: count5
+    editable: true
+    # 주제 이름: 이 페이지가 다루는 중심 대상의 이름(예: 'vitamin D deficiency', 'Darlene Conner')이나 그 표준 동의어·약어.
+    # 대명사나 'it/this'로만 가리킨 문장은 세지 않는다
+    definition: "The topic name is the name of the page's main subject (e.g., 'vitamin D deficiency', 'Darlene Conner') or its standard synonym or abbreviation. A sentence counts if it states the topic name explicitly; sentences that refer to it only through pronouns or 'it'/'this' do not count."
+    item: {one: "states the topic name explicitly", many: "state the topic name explicitly"}
+    safety:
+      allow:
+        # 모호한 대명사나 막연한 지칭을 주제 이름으로 바꾼다
+        - "Replace an ambiguous pronoun or vague reference with the topic name."
+      forbid:
+        # 이미 뜻이 분명한 문장에 주제 이름을 끼워 넣기
+        - "Inserting the topic name into sentences that are already clear."
+        # 한 문장에 주제 이름을 두 번 이상 쓰기
+        - "Using the topic name more than once in a sentence."
+    # 비고: chunk_independence와 겹칠 수 있음 → 정제 ④에서 확인
+
+  - id: chunk_independence
+    name: 조각 독립성
+    name_en: Passage independence
+    source: SFE               # + SAGEO-SA "self-contained claims"
+    unit: passage
+    dependency: document
+    fields: [body]
+    measure: sentence_ids
+    levels: reverse_count5
+    editable: true
+    # 매달린 지칭이 있는 문장: 가리키는 대상이 그 passage와 메타 안에 없는 표현이 있는 문장
+    # (예: 'he', 'this method', 'as mentioned above', 'the second one')
+    definition: "A sentence counts if it contains a dangling reference: an expression whose referent is not inside this passage or the META block (e.g., 'he', 'this method', 'as mentioned above', 'the second one')."
+    item: {one: "contains a dangling reference", many: "contain a dangling reference"}
+    safety:
+      allow:
+        # 매달린 지칭을 그것이 가리키는 대상의 이름으로 바꾼다
+        - "Replace a dangling reference with the name of what it refers to."
+        # passage 첫머리에서 주어를 다시 밝힌다
+        - "Restate the subject at the start of the passage."
+      forbid:
+        # 주장을 바꾸기
+        - "Changing claims."
+
+  # ── 내용 · passage 단위 · 질의 종속 [Q] ─────────────────────────
+
+  - id: body_query_alignment
+    name: 본문 질의 정합성 [Q]
+    name_en: Body-query alignment
+    source: new
+    unit: passage
+    dependency: query
+    fields: [body]
+    measure: embedding+rule   # 분위수 변환 후 평균: (a) 질의 핵심어(불용어 제외)의 passage 등장 비율
+                              #                       (b) 질의와 passage 임베딩 코사인
+    levels: continuous
+    editable: true
+    safety:
+      allow:
+        # passage가 다루는 내용에 질의의 표현을 쓴다
+        - "Use the query's wording for content the passage covers."
+        # 질의에 직접 답하는 문장을 더한다
+        - "Add a sentence that addresses the query directly."
+      forbid:
+        # 질의 단어를 부자연스럽게 반복하기
+        - "Repeating query words unnaturally."
+    rewriter_bins:
+      # passage가 질의의 핵심을 거의 다루지 않는다
+      0.0: "The passage barely addresses the core of the query."
+      # passage가 질의의 핵심을 일부 다룬다
+      0.5: "The passage partly addresses the core of the query."
+      # passage가 질의의 핵심을 직접 다루고 질의의 표현을 자연스럽게 쓴다
+      1.0: "The passage directly addresses the core of the query and naturally uses its wording."
+
+  # ── 구조 · 문서 단위 ─────────────────────────────────────────────
+
+  - id: title_informativeness
+    name: 제목 정보성
+    name_en: Title informativeness
+    source: SAGEO-struct
+    unit: document
+    dependency: document      # 질의와 무관하게 잰다. 질의와의 일치는 structural_query_alignment [Q]가 본다
+    fields: [structural]
+    measure: llm_level
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    # <title> 필드만 본다. 끝에 붙은 사이트 이름('| Healthline')은 무시한다
+    definition: "Judge the title field only. Ignore a trailing site name (e.g., '| Healthline')."
+    safety:
+      allow:
+        # 페이지의 구체적인 대상과 다루는 측면으로 제목을 다시 쓴다
+        - "Rewrite the title to name the page's specific subject and what the page offers about it."
+        # 사이트 이름이 있으면 유지한다
+        - "Keep the site name if present."
+      forbid:
+        # 페이지 내용과 어긋나는 약속(예: 본문보다 많은 개수의 팁)
+        - "Promises that contradict the page (e.g., more tips than the page lists)."
+        # 낚시성 표현
+        - "Clickbait wording."
+    rubric:
+      # 제목이 없거나 사이트 이름뿐이다
+      0.0:  "Missing, or only the site name."
+      # 주제를 밝히지 않는 일반적인 제목이다
+      0.25: "Generic; does not name the topic."
+      # 넓은 주제는 밝히지만 이 페이지의 구체적인 대상은 밝히지 않는다
+      0.5:  "Names the broad topic but not the page's specific subject."
+      # 구체적인 대상은 밝히지만, 그것에 대해 무엇을 다루는지는 없다
+      0.75: "Names the specific subject, but not what the page offers about it."
+      # 구체적인 대상과, 그것에 대해 다루는 측면·범위·개수를 간결하게 밝힌다
+      1.0:  "Names the specific subject and what the page offers about it (aspect, scope, or count), concisely."
+    examples:                 # 비타민 D 결핍 증상 페이지의 예
+      0.0:  "Home | Healthline"
+      0.25: "Health Article"
+      0.5:  "Vitamins and Your Health"
+      0.75: "Vitamin D Deficiency"
+      1.0:  "Vitamin D Deficiency: 9 Symptoms, Causes, and Treatments"
+
+  - id: meta_description
+    name: 메타 설명
+    name_en: Meta description
+    source: SAGEO-struct
+    unit: document
+    dependency: document
+    fields: [structural]
+    measure: llm_level
+    levels: [0, 0.5, 1.0]
+    editable: true
+    # 메타 설명 필드만 본다. 구체적 사실 = 특정 대상의 이름, 쓸모 있는 수치, 구체적인 결론 중 하나
+    definition: "Judge the meta description field only. A specific fact is a statement with a named entity, a usable number, or a concrete finding."
+    safety:
+      allow:
+        # 페이지의 대상과 구체적 사실로 1~2문장(약 160자 이하)을 쓴다
+        - "Write 1-2 sentences (about 160 characters or fewer) that state the page's subject and a specific fact."
+      forbid:
+        # 페이지 내용과 어긋나는 진술
+        - "Statements that contradict the page."
+        # 키워드 나열
+        - "Keyword lists."
+    rubric:
+      # 메타 설명이 없거나 비어 있다
+      0.0: "Missing or empty."
+      # 있지만 이 페이지를 요약하지 않는다(사이트 전체 소개 문구, 일반적인 문장, 구체적 사실이 없는 문장)
+      0.5: "Present, but does not summarize this page: a site-wide slogan, generic text, or a sentence with no specific fact."
+      # 이 페이지의 구체적인 대상과 구체적 사실 하나 이상을 밝힌다
+      1.0: "States this page's specific subject and at least one specific fact."
+    examples:                 # 비타민 D 결핍 증상 페이지의 예
+      0.0: ""
+      0.5: "Your trusted source for health news and advice since 1999."
+      1.0: "Vitamin D deficiency can cause fatigue, bone pain, and muscle weakness. Learn the most common symptoms and how it is treated."
+
+  - id: jsonld
+    name: 구조화 데이터 (JSON-LD)
+    name_en: Structured data (JSON-LD)
+    source: SAGEO-struct
+    unit: document
+    dependency: document
+    fields: [structural]
+    measure: rule
+    levels: [0, 0.5, 1.0]
+    editable: true
+    rule:
+      # SAGEO가 GE에 보여 주는 형태로 판단한다: filter_jsonld_for_generator(타입별 허용 필드만 남김) 적용, @graph는 펼친다
+      visible_view: "SAGEO filter_jsonld_for_generator (type-wise field whitelist), with @graph flattened"
+      # 내용 타입: 페이지 내용 자체를 설명하는 타입. 나머지(Organization, WebSite, WebPage, Person, LocalBusiness, BreadcrumbList 등)는 기본 타입
+      content_types: [Article, NewsArticle, BlogPosting, ScholarlyArticle, MedicalWebPage, DiscussionForumPosting, Product, Review, FAQPage, QAPage, HowTo, Recipe, Event, Course, Dataset, VideoObject, Movie, TVSeries, SoftwareApplication, Service, CreativeWork]
+      # 채워진 필드: 내용 타입 객체에서 필터 후 남은 필드 중 비어 있지 않은 것(@type·@context 제외)
+      min_filled_fields: 2
+    rewriter_note: "show the filter's field whitelist for the chosen type; fields outside it are invisible to the engine"  # 필터 밖 필드는 엔진에 안 보이므로 Rewriter에 허용 필드 목록을 보여 준다
+    safety:
+      allow:
+        # 페이지 내용에 맞는 schema.org 타입으로 JSON-LD를 추가하거나 채운다
+        - "Add or complete JSON-LD with a schema.org type that matches the page content."
+      forbid:
+        # 페이지 내용과 어긋나는 값
+        - "Values that contradict the page."
+        # 잘못된 JSON이나 schema.org에 없는 타입
+        - "Invalid JSON or types that are not in schema.org."
+    rubric:
+      # 엔진에 보이는 JSON-LD가 없다(없거나, 파싱되지 않거나, 필터 후 비어 있다)
+      0.0: "No JSON-LD visible to the engine (missing, unparseable, or empty after filtering)."
+      # JSON-LD는 보이지만, 채워진 필드가 2개 이상인 내용 타입(Article, Product, FAQPage 등)이 없다
+      0.5: "JSON-LD is visible, but no content type (e.g., Article, Product, FAQPage) has at least 2 filled fields."
+      # 채워진 필드가 2개 이상인 내용 타입이 하나 이상 있다
+      1.0: "At least one content type (e.g., Article, Product, FAQPage) has at least 2 filled fields."
+
+  - id: heading_hierarchy
+    name: 헤딩 계층
+    name_en: Heading hierarchy
+    source: SFE               # STS 우선순위 3위 (heading depth)
+    unit: document
+    dependency: document
+    fields: [structural]
+    measure: rule             # 크롤링된 헤딩의 태그 레벨(h1~h6)로 계산. SAGEO는 엔진 입력에 태그를 그대로 넣으므로 계층이 보인다
+                              # 확인(2026-11-04, 2,000문서): 헤딩 있는 문서 98%, 문서당 중앙값 15개, h1~h6 태그 보존
+    levels: [0, 0.5, 1.0]
+    editable: true
+    rule:
+      # SAGEO가 엔진에 보여 주는 헤딩만 센다: 헤딩당 500자에서 자르고, 합계 3,500자를 넘는 헤딩부터는 버린다
+      visible_view: "SAGEO generator limits: each heading cut at 500 chars; stop adding headings once the total would exceed 3,500 chars"
+      # 평평함: 한 레벨만 씀 / 건너뜀: 내려갈 때 레벨을 건너뜀(h2 다음 h4) / h1이 2개 이상
+      flat: "only one heading level is used"
+      skipped_level: "going down, a level is skipped (e.g., h2 followed by h4)"
+      multiple_h1: "more than one h1"
+    safety:
+      allow:
+        # 두 레벨 이상, 건너뜀 없음, h1 하나가 되도록 헤딩을 추가하거나 태그 레벨을 고친다
+        - "Add or retag headings so that at least two levels are used, no level is skipped going down, and there is at most one h1."
+      forbid:
+        # 키워드를 채워 넣은 헤딩
+        - "Keyword-stuffed headings."
+        # 페이지 내용과 어긋나는 헤딩
+        - "Headings that contradict the page."
+    rubric:
+      # 엔진에 보이는 헤딩이 없다
+      0.0: "No headings visible to the engine."
+      # 헤딩은 있지만 한 레벨만 쓰거나, 내려갈 때 레벨을 건너뛰거나(h2 다음 h4), h1이 2개 이상이다
+      0.5: "Headings exist, but only one level is used, a level is skipped going down (e.g., h2 then h4), or there is more than one h1."
+      # 두 레벨 이상을 쓰고, 건너뛴 레벨이 없고, h1은 1개 이하다
+      1.0: "At least two levels are used, no level is skipped going down, and there is at most one h1."
+
+  # ── 구조 · 문서 단위 · 질의 종속 [Q] ───────────────────────────
+
+  - id: structural_query_alignment
+    name: 구조 필드 질의 정합성 [Q]
+    name_en: Structural-field query alignment
+    source: SAGEO-SA          # entity mirroring
+    unit: document
+    dependency: query
+    fields: [structural]
+    measure: rule             # 질의 핵심어·엔티티가 title/meta/headings/jsonld에 등장하는 비율
+                              # (필드 가중치는 SAGEO BM25 필드별 RRF 가중치를 따른다; 현재 모두 1.0)
+    levels: continuous
+    editable: true
+    safety:
+      allow:
+        # 질의의 핵심어나 엔티티를 제목·메타 설명·헤딩·JSON-LD에 자연스럽게 쓴다
+        - "Use the query's key terms or entities naturally in the title, meta description, headings, or JSON-LD."
+      forbid:
+        # 키워드 나열이나 부자연스러운 반복
+        - "Keyword lists or unnatural repetition."
+    rewriter_bins:
+      # 구조 필드에 질의의 핵심어나 엔티티가 없다
+      0.0: "The structural fields contain none of the query's key terms or entities."
+      # 구조 필드에 질의의 핵심어나 엔티티가 일부 있다
+      0.5: "The structural fields contain some of the query's key terms or entities."
+      # 구조 필드에 질의의 핵심어와 엔티티가 자연스럽게 모두 들어 있다
+      1.0: "The structural fields naturally contain all of the query's key terms and entities."

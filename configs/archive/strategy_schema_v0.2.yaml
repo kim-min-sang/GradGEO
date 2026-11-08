@@ -1,0 +1,408 @@
+# GradGEO 전략 스키마 — 초안 v0.2 (사용자 검토 전)
+#
+# z ∈ [0,1]^19 후보 축의 정의. 순서 = z의 인덱스.
+# 19개는 "후보 풀"이다. 정제 절차(refinement)를 데이터에 적용해 최종 K ≤ 12로 줄인다.
+#
+# 필드 설명
+#   id          : 코드에서 쓰는 이름
+#   name        : 한국어 이름
+#   source      : 후보의 출처
+#                   GEO          = GEO(KDD 2024)의 방법
+#                   SAGEO-struct = SAGEO Arena의 구조 필드
+#                   SAGEO-SA     = SAGEO StageAware 프롬프트의 원칙
+#                   SFE          = GEO-SFE(2603.29979)의 Search-then-Synthesize 특징
+#                   new          = 이번 설계에서 추가
+#   dependency  : document = 문서만 보고 측정 → z_doc, 인코더가 학습·예측
+#                 query    = (질의, 문서) 쌍마다 측정 → z_Q, 임베딩·규칙으로 즉석 계산(LLM 안 씀)
+#   fields      : 적용·편집 위치 (structural = title/meta/headings/jsonld, body = 본문)
+#   measure     : llm_judge | rule | embedding
+#   levels      : 판정 단계. 축마다 다를 수 있다.
+#                   [0, 0.25, 0.5, 0.75, 1.0] = 5단계, [0, 0.5, 1.0] = 3단계,
+#                   continuous = 규칙·임베딩 원값을 학습 데이터 분위수로 [0,1]에 고정 변환
+#   editable    : Rewriter가 바꿔도 되는지 (false면 gradient mask = 0)
+#   mask_if_absent : true면 원문에 재료가 없을 때 문서별로 이 축을 잠근다
+#                    (예: 수치가 하나도 없는 문서에서 수치를 늘리라고 하면 지어내야 하므로)
+#   safety      : 재작성할 때 반드시 지킬 제약
+#   rubric      : 레벨별 기준 문장. 판정 LLM과 Rewriter가 같은 문장을 쓴다.
+#                 Rewriter에는 바꿀 축마다 루브릭 전체를 보여 주고 현재 레벨(▶)과 목표 레벨(★)을 표시한다.
+#                 목표 레벨은 gradient가 정한 z*를 반올림한 값이라 여러 칸 이동도 있다.
+#                 continuous 축은 rewriter_bins만 둔다(Rewriter 지시용 3구간 문장).
+#
+# 판정 프롬프트에는 이 루브릭의 영어 번역본을 쓴다(코퍼스가 영어). 이 파일은 검토용 한국어 원본이다.
+#
+# 의도적으로 뺀 것
+#   - Keyword Stuffing(GEO): 스팸 조작이라 white-hat 제약에 어긋난다. 질의 정합성 축으로 대체하고 반복은 safety로 막는다.
+#   - 링크 밀도·내비게이션(SFE Iterative/Integrated 특징): 우리 엔진은 링크를 보지 않는다. 마크다운 확장 실험에서만.
+#   - 형식 다양성(목록·표): 현재 엔진 입력이 평문이라 보이지 않는다. 마크다운 확장 실험에서만.
+
+version: 0.2-draft
+
+judge:
+  model: gpt-5-mini
+  samples: 3                  # 중앙값 사용. 파일럿(500문서 × 5회)에서 3회 중앙값 ≈ 5회 중앙값이면 3으로 확정
+  pilot_docs: 500
+  pilot_samples: 5
+  pilot_sampling:             # 파일럿 문서 뽑는 법 (2026-10-29)
+    split: train              # 학습 split 질의에서만. 파일럿 5회 중앙값은 인코더 학습 레이블로 재사용
+    per_dataset: equal        # 9개 데이터셋 균등(데이터셋당 질의 약 55~56개, 합 500)
+    docs_per_query: 1         # 질의마다 그 질의의 문서 1개를 무작위로
+    dedupe_url: true          # 이미 뽑힌 URL이면 다시 뽑기
+    exclude_over_max_doc_chars: true
+    check_length_distribution: true  # 뽑은 뒤 길이 분포가 코퍼스와 비슷한지 확인, 치우치면 다시 뽑기
+    seed: 42
+  input: full_document        # 문서 전체(제목·메타·헤딩·JSON-LD·본문). 앞부분만 자르지 않는다
+  max_doc_chars: 241659       # 코퍼스 p99(고유 URL 156,015개, 전체 필드 글자 수; 2026-10-29 재수집 후 확정 코퍼스 172,632쌍에서 측정). 초과 1%는 판정 표본·타깃에서 제외하고 z는 인코더로 계산(경쟁 문서로는 코퍼스에 남김)
+  one_call_per_document: true # 문서 종속 축 전부를 한 번의 호출로 JSON 반환
+  second_judge: null          # 2차 판정자는 일단 쓰지 않음(사용자 결정 2026-10-28)
+
+normalization:
+  continuous_fit_on: train    # 분위수 변환은 학습 split 데이터로만 적합하고 고정
+
+refinement:                   # 정제 절차: 후보 19개 → 최종 K ≤ max_axes
+                              # ①~④는 통과/탈락 결과를 보지 않는다. ⑤만 head 성능을 보며 학습·검증 split만 쓴다
+                              # ① 보임·편집 가능: 스키마 작성 때 적용(엔진 입력에 보이고, 지어내지 않고 고칠 수 있는 특징만)
+  test_retest:                # ② 측정 신뢰도. llm_judge 축에만 적용(rule·embedding 축은 항상 같은 값이라 제외)
+    rho_min_median3: 0.8      # 3회 중앙값 레이블 기준 순위 상관(Spearman)
+    rho_min_single: 0.6       # 같은 기준을 1회 판정끼리로 환산한 값(Spearman–Brown, k=3이면 0.6 → 약 0.82)
+    collapse_to_3:            # ②-b 5단계 축이 위 기준에 못 미치면 이미 받은 판정을 3단계로 묶어 다시 계산(재판정 없음)
+      map: {0.0: 0.0, 0.25: 0.0, 0.5: 0.5, 0.75: 1.0, 1.0: 1.0}
+                              # 5단계로 통과 → 5단계 유지 / 5단계 실패·3단계 통과 → 그 축만 3단계로 전환(루브릭도 합침)
+                              # 둘 다 실패 → 제거. 3단계로 바뀐 축은 조작 시험과 ③을 3단계 기준으로 다시 확인
+  perturbation:               # ② 타당도: 문서를 의도적으로 조작한 뒤 다시 판정
+    hit_min: 0.8              # 점수가 예상 방향으로 움직인 비율. 점수가 그대로면 실패로 센다
+    strong_edit: true         # 단계가 확실히 바뀌도록 크게 조작한다(예: 수치 전부 삭제)
+  max_single_level_frac: 0.9  # ③ 한 레벨에 몰린 문서 비율 상한. 이산 축에만 적용(연속 축은 분위수 변환이라 제외).
+                              #   파일럿에서 먼저 보고, 본 판정 후 다시 확인
+  merge:                      # ④ 중복
+    abs_r: 0.7                # 축 간 |Spearman| 이상이면 병합
+    keep: higher_reliability  # ②의 신뢰도가 더 높은 축을 남긴다
+  importance:                 # ⑤ 쓸모: permutation importance(검증 split)
+    shuffles: 10              # 10번 섞은 평균 하락으로 판단
+    min_drop_auc: 0.01        # R·K head: 검증 AUC 절대 하락
+    min_drop_spearman: 0.01   # G head: 인용률과의 순위 상관 절대 하락(레이블이 연속값이라 AUC 대신)
+    remove_if: all_heads_below  # 세 head 모두에서 기준 미만일 때만 제거
+  max_axes: 12                # ①~⑤ 뒤에도 넘으면 ⑤ 중요도 낮은 순으로 자른다(목표 10개 안팎)
+
+strategies:
+
+  # ── 내용 · 문서 종속 ──────────────────────────────────────────────
+
+  - id: statistics
+    name: 수치 근거
+    source: GEO
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: true
+    safety: 원문에 없는 수치를 만들지 않는다. 원문 수치를 드러내거나 앞으로 옮기거나 단위·기준을 명확히 할 뿐이다.
+    rubric:
+      0.0:  수치가 전혀 없다
+      0.25: 수치가 1~2개 있지만 핵심 주장과 무관하거나 단위·맥락이 없다
+      0.5:  일부 핵심 주장에 수치가 있다
+      0.75: 대부분의 핵심 주장에 단위·맥락이 있는 수치가 있다
+      1.0:  핵심 주장마다 구체적인 수치(단위, 대상, 시점 포함)가 붙어 있다
+
+  - id: quotation
+    name: 인용구
+    source: GEO
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.5, 1.0]
+    editable: true
+    mask_if_absent: true
+    safety: 실존하지 않는 인물이나 발언을 지어내지 않는다. 원문에 있는 발언만 인용 형태로 드러낸다.
+    rubric:
+      0.0: 직접 인용이 없다
+      0.5: 발언자가 밝혀진 직접 인용이 1개 있다
+      1.0: 핵심 주장을 뒷받침하는, 발언자가 밝혀진 직접 인용이 2개 이상 있다
+
+  - id: cite_sources
+    name: 출처
+    source: GEO
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: true
+    safety: 존재하지 않는 출처나 링크를 만들지 않는다. 원문에 있는 출처만 본문에 명시한다.
+    rubric:
+      0.0:  출처 표기가 전혀 없다
+      0.25: '"연구에 따르면", "전문가들은" 같은 막연한 출처만 있다'
+      0.5:  일부 주장에 구체적인 출처(기관, 저자, 문헌명)가 있다
+      0.75: 대부분의 사실 주장에 구체적인 출처가 있다
+      1.0:  사실 주장마다 구체적인 출처가 있고 참고 문헌이 정리되어 있다
+
+  - id: fluency
+    name: 유창성
+    source: GEO
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 의미를 바꾸지 않는다.
+    rubric:
+      0.0:  문법 오류가 많고 문장이 끊겨 읽기 어렵다 (스크랩 잔재, 깨진 문장 포함)
+      0.25: 오류나 어색한 문장이 자주 보인다
+      0.5:  대체로 자연스럽지만 어색한 곳이 눈에 띈다
+      0.75: 어색한 곳이 드물다
+      1.0:  모든 문장이 매끄럽고 문장 사이 연결이 자연스럽다
+    # 비고: easy_language와 |r| ≥ 0.7이면 정제 ④에서 "가독성"으로 병합
+
+  - id: easy_language
+    name: 쉬운 표현
+    source: GEO
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 단순화하면서 사실이 틀어지지 않게 한다.
+    rubric:
+      0.0:  긴 문장과 정의 없는 용어가 많아 전문가가 아니면 이해하기 어렵다
+      0.25: 일반인이 상당한 노력을 들여야 이해할 수 있다
+      0.5:  일반인이 노력하면 이해할 수 있다
+      0.75: 대부분 쉽게 이해되고 일부만 어렵다
+      1.0:  짧고 명확한 문장이며 어려운 용어는 풀어서 설명한다
+
+  - id: authoritative_tone
+    name: 권위 어조
+    source: GEO
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 근거 없이 확신을 과장하지 않는다.
+    rubric:
+      0.0:  모호하고 망설이는 어조이며 근거 없는 추측성 표현이 많다
+      0.25: 확신이 약하고 주관적인 표현이 많다
+      0.5:  중립적인 어조다
+      0.75: 대체로 단정적이고 전문가다운 어조다
+      1.0:  근거를 바탕으로 일관되게 단정적이고 전문가다운 어조다
+    # 비고: 반복 일관성·조작 검사에서 탈락할 가능성이 높은 축
+
+  - id: technical_terms
+    name: 전문 용어
+    source: GEO
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 용어를 잘못 쓰지 않는다. 문서 주제에 맞는 용어만 쓴다.
+    rubric:
+      0.0:  도메인 용어 없이 일상어로만 쓰여 있다
+      0.25: 용어가 드물거나 부정확하게 쓰였다
+      0.5:  핵심 용어가 일부 쓰였다
+      0.75: 대부분 정확한 용어가 쓰였다
+      1.0:  도메인의 정확한 용어가 일관되게 쓰였다
+    # 비고: easy_language와 반대 방향일 수 있음 → 최적화 시 상충 진단 대상
+
+  - id: unique_words
+    name: 어휘 다양성
+    source: GEO
+    dependency: document
+    fields: [body]
+    measure: rule             # MTLD(길이에 덜 민감한 어휘 다양성 지표)
+    levels: continuous
+    editable: true
+    mask_if_absent: false
+    safety: 뜻이 모호해지게 바꾸지 않는다.
+    rewriter_bins:
+      0.0: 같은 단어와 표현이 반복된다
+      0.5: 어휘 다양성이 보통이다
+      1.0: 같은 대상을 정확하면서도 다양한 표현으로 서술한다
+
+  - id: concrete_claims
+    name: 구체적 주장
+    source: SAGEO-SA
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 사례나 조건을 지어내지 않는다. 원문 내용을 구체적으로 다시 쓸 뿐이다.
+    rubric:
+      0.0:  일반론뿐이고 구체적인 대상, 사례, 조건이 없다
+      0.25: 구체적인 내용이 드물다
+      0.5:  일부 주장에 고유명사, 사례, 조건이 있다
+      0.75: 대부분의 주장에 구체적인 대상이나 사례가 있다
+      1.0:  모든 핵심 주장이 구체적인 대상, 사례, 조건으로 특정되어 있다
+    # 비고: 수치는 statistics가 잰다. 여기서는 수치 외의 구체성만 본다
+
+  - id: topic_term_consistency
+    name: 주제어 일관성
+    source: SAGEO-SA          # keyword reinforcement
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 부자연스럽게 반복하지 않는다(키워드 스터핑 금지).
+    rubric:
+      0.0:  핵심 주제어가 거의 반복되지 않고 대명사나 모호한 지칭이 많다
+      0.25: 대부분의 문단에 핵심 주제어가 없다
+      0.5:  일부 문단에만 핵심 주제어가 명시되어 있다
+      0.75: 대부분의 문단에 핵심 주제어가 명시되어 있다
+      1.0:  모든 문단이 핵심 주제어(주제 이름)를 명시해 주제와 분명히 연결되어 있다
+
+  # ── 내용 · 질의 종속 [Q] ─────────────────────────────────────────
+
+  - id: body_query_alignment
+    name: 본문 질의 정합성 [Q]
+    source: new
+    dependency: query
+    fields: [body]
+    measure: embedding+rule   # 분위수 변환 후 평균: (a) 질의 핵심어(불용어 제외)의 본문 등장 비율
+                              #                       (b) 질의와 본문 passage 임베딩 코사인의 최댓값
+    levels: continuous
+    editable: true
+    mask_if_absent: false
+    safety: 키워드를 부자연스럽게 반복하지 않는다. 질의에 맞추려고 문서에 없는 사실을 만들지 않는다.
+    rewriter_bins:
+      0.0: 본문이 질의의 핵심 내용을 거의 다루지 않는다
+      0.5: 본문이 질의의 핵심 내용을 일부 다룬다
+      1.0: 본문이 질의의 핵심 내용을 직접 다루고 질의의 표현을 자연스럽게 사용한다
+
+  - id: answer_front_loading
+    name: 앞부분 답변성 [Q]
+    source: SAGEO-SA          # 핵심 주장 전진 배치
+    dependency: query
+    fields: [body]
+    measure: embedding        # sim(질의, 본문 첫 256토큰) / max_p sim(질의, passage p), [0,1]로 자름
+    levels: continuous
+    editable: true
+    mask_if_absent: false
+    safety: 내용을 삭제하지 않는다. 순서를 조정하거나 앞에 요약 문장을 추가한다.
+    rewriter_bins:
+      0.0: 질의에 대한 답이 문서 뒷부분에만 있다
+      0.5: 질의에 대한 답이 문서 중간쯤에 나온다
+      1.0: 첫 문단에서 질의에 바로 답한다
+
+  # ── 구조 · 문서 종속 ─────────────────────────────────────────────
+
+  - id: title_informativeness
+    name: 제목 정보성
+    source: SAGEO-struct
+    dependency: document
+    fields: [structural]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 본문에 없는 내용을 제목에 넣지 않는다.
+    rubric:
+      0.0:  제목이 없거나 내용과 무관하다 (사이트 이름만 있는 경우 포함)
+      0.25: 매우 일반적인 제목이다
+      0.5:  주제는 드러나지만 핵심 엔티티나 구체적인 정보가 없다
+      0.75: 핵심 엔티티는 있지만 구체적인 정보(수치, 범위, 관점)가 부족하다
+      1.0:  핵심 엔티티와 구체적인 정보가 간결하게 담겨 있다
+
+  - id: meta_description
+    name: 메타 설명
+    source: SAGEO-struct
+    dependency: document
+    fields: [structural]
+    measure: llm_judge
+    levels: [0, 0.5, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 본문과 어긋나는 요약을 쓰지 않는다.
+    rubric:
+      0.0: 메타 설명이 없거나 내용과 무관하다
+      0.5: 있지만 사이트 소개 같은 일반적인 문장이다
+      1.0: 문서의 핵심 주장을 정확하게 요약한다
+
+  - id: jsonld
+    name: 구조화 데이터 (JSON-LD)
+    source: SAGEO-struct
+    dependency: document
+    fields: [structural]
+    measure: rule             # 파싱 + 타입 + 핵심 속성 개수
+    levels: [0, 0.5, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: '본문에 없는 사실을 넣지 않는다. SAGEO 형식("key: value" 텍스트)을 따른다.'
+    rubric:
+      0.0: 없거나 파싱되지 않는다
+      0.5: WebPage, Organization 같은 기본 타입만 있고 내용 속성이 부족하다
+      1.0: 내용에 맞는 타입(Article, Product, FAQPage 등)과 핵심 속성(headline, description, 주요 엔티티)이 채워져 있다
+
+  - id: heading_hierarchy
+    name: 헤딩 계층
+    source: SFE               # STS 우선순위 3위 (heading depth)
+    dependency: document
+    fields: [structural]
+    measure: rule             # 크롤링된 헤딩의 태그 레벨(h1~h6)로 계산
+    levels: [0, 0.5, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 본문 순서를 바꿀 때 의미가 바뀌지 않게 한다.
+    rubric:
+      0.0: 헤딩이 없다
+      0.5: 헤딩이 한 레벨뿐이거나 계층이 불규칙하다
+      1.0: 논리적인 계층(H2 아래 H3 등)으로 섹션이 구성되어 있다
+
+  - id: upfront_density
+    name: 앞부분 정보 밀도
+    source: SFE               # STS 우선순위 2위
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 본문에 없는 정보를 앞부분에 만들지 않는다. 기존 핵심 정보를 앞으로 요약·배치한다.
+    rubric:
+      0.0:  첫 문단이 인사말, 광고, 내비게이션 잔재처럼 정보가 없다
+      0.25: 첫 문단에 정보가 적다
+      0.5:  첫 문단에 주제는 있지만 핵심 사실이 적다
+      0.75: 첫 문단에 핵심 사실이 여러 개 있다
+      1.0:  첫 문단(약 100단어)에 핵심 엔티티, 사실, 결론이 밀도 높게 담겨 있다
+    # 비고: 질의와 무관한 문서 자체 속성. 질의 종속인 answer_front_loading과 구분
+
+  - id: chunk_independence
+    name: 조각 독립성
+    source: SFE               # + SAGEO-SA "self-contained claims"
+    dependency: document
+    fields: [body]
+    measure: llm_judge
+    levels: [0, 0.25, 0.5, 0.75, 1.0]
+    editable: true
+    mask_if_absent: false
+    safety: 문단을 독립적으로 만들면서 내용을 바꾸지 않는다.
+    rubric:
+      0.0:  대부분의 문단이 앞뒤 문맥 없이는 이해되지 않는다 ("위에서 말한", 지칭 대상이 없는 대명사)
+      0.25: 독립적으로 이해되는 문단이 드물다
+      0.5:  절반 정도의 문단이 독립적으로 이해된다
+      0.75: 대부분의 문단이 독립적으로 이해된다
+      1.0:  모든 문단이 주어를 명시하고, 256토큰 조각으로 잘려도 의미가 유지된다
+
+  # ── 구조 · 질의 종속 [Q] ─────────────────────────────────────────
+
+  - id: structural_query_alignment
+    name: 구조 필드 질의 정합성 [Q]
+    source: SAGEO-SA          # entity mirroring
+    dependency: query
+    fields: [structural]
+    measure: rule             # 질의 핵심어·엔티티가 title/meta/headings/jsonld에 등장하는 비율
+                              # (필드 가중치는 SAGEO BM25 필드별 RRF 가중치를 따른다)
+    levels: continuous
+    editable: true
+    mask_if_absent: false
+    safety: 키워드를 부자연스럽게 반복하지 않는다. 본문에 없는 엔티티를 구조 필드에 넣지 않는다.
+    rewriter_bins:
+      0.0: 구조 필드에 질의의 핵심어나 엔티티가 없다
+      0.5: 구조 필드에 질의의 핵심어나 엔티티가 일부 있다
+      1.0: 구조 필드에 질의의 핵심어와 엔티티가 자연스럽게 모두 들어 있다

@@ -1,0 +1,8 @@
+.env.local
+.env*
+!.env.example
+data/
+third_party/
+logs/
+__pycache__/
+*.pyc
