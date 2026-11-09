@@ -4,11 +4,12 @@ whether a passage of the Top-N pool is in the BM25 Top-100?
 
 Free axes (handoff numbering): #8 unique_words, #11 body_query_alignment,
 #14 jsonld, #15 heading_hierarchy, #17 structural_query_alignment, #18 list_table,
-#19 emphasis, #20 paragraph_length. Continuous axes (#8, #11, #17) are quantile-
+#19 emphasis, #20 paragraph_length. Continuous axes #8 and #11 are quantile-
 transformed with the train split; #11 = mean of its two transformed parts (key-term
 share, embedding cosine) when the cosine is available, else the key-term share alone.
-Diagnostic variants marked "idf" replace the key-term shares of #11 and #17 by their
-idf-weighted versions (not the schema definition).
+#17 is its raw share (schema v0.6).
+The key-term shares of #11 and #17 are idf-weighted (schema v0.5, revised 2026-11-08);
+diagnostic variants marked "flat" use the unweighted shares (the earlier definition).
 
 Train on the train split, report on the validation split (dev and test untouched):
     pooled AUC         y_R over all validation (query, passage) pairs
@@ -17,6 +18,10 @@ Train on the train split, report on the validation split (dev and test untouched
     relevant-only AUC  UMBRELA-relevant documents (>= 2) of the pre-check sample:
                        Top-100 vs. 101-N, document logit = its best passage's logit
     permutation importance of each axis (10 shuffles, pooled AUC drop)
+
+The head used for prescriptions (experiments/compare_mini.py) is the seed-0 model of
+the "free 8 axes" variant whose PCA size (0 / 16 / 32) has the best validation
+per-query AUC (handoff §6); it is saved with the z of every pool pair.
 
 Usage:
     python experiments/r_head_free.py [--n 300] [--seeds 3]
@@ -46,6 +51,9 @@ OUT_DIR = DATA / "r_head_free"
 AXES = ["#8 unique_words", "#11 body_query_alignment", "#14 jsonld", "#15 heading_hierarchy",
         "#17 structural_query_alignment", "#18 list_table", "#19 emphasis", "#20 paragraph_length"]
 BOUNDARY = 100
+# #17 keeps its raw idf-weighted share (schema v0.6, 2026-11-09): its rubric names absolute
+# levels (none / some / all key terms), and the quantile scale called a share of 0.58 "all"
+RAW_SCALE = {"struct_terms"}
 
 
 def doc_of(chunk_id: str) -> str:
@@ -66,8 +74,8 @@ def load(n):
         "unique_words": rule["unique_words"][idx],
         "body_terms": q["body_query_terms"],
         "body_cos": q["body_query_cosine"] if "body_query_cosine" in q.files else None,
-        "body_terms_idf": q["body_query_terms_idf"] if "body_query_terms_idf" in q.files else None,
-        "struct_terms_idf": q["structural_query_terms_idf"] if "structural_query_terms_idf" in q.files else None,
+        "body_terms_flat": q["body_query_terms_flat"] if "body_query_terms_flat" in q.files else None,
+        "struct_terms_flat": q["structural_query_terms_flat"] if "structural_query_terms_flat" in q.files else None,
         "jsonld": rule["jsonld"][idx],
         "heading_hierarchy": rule["heading_hierarchy"][idx],
         "struct_terms": q["structural_query_terms"],
@@ -83,19 +91,37 @@ def load(n):
     return split, query_id, chunk_id, ranks, scores, raw
 
 
-def build_z(raw, train_mask, idf=False):
-    def qt(x):
-        t = QuantileTransformer(n_quantiles=1000, subsample=10**9, random_state=0)
-        t.fit(x[train_mask].reshape(-1, 1))
-        return t.transform(x.reshape(-1, 1)).ravel()
+def fit_quantiles(raw, train_mask, flat=False) -> dict:
+    """Quantile transforms of the continuous raw values, fitted on the train split
+    (axes in RAW_SCALE keep their raw value)."""
+    suffix = "_flat" if flat else ""
+    out = {}
+    for key in ("unique_words", "body_terms", "body_cos", "struct_terms"):
+        src = key + suffix if key in ("body_terms", "struct_terms") else key
+        if key not in RAW_SCALE and raw[src] is not None:
+            t = QuantileTransformer(n_quantiles=1000, subsample=10**9, random_state=0)
+            out[key] = t.fit(raw[src][train_mask].reshape(-1, 1))
+    return out
 
-    suffix = "_idf" if idf else ""
-    body = qt(raw["body_terms" + suffix])
-    if raw["body_cos"] is not None:
-        body = (body + qt(raw["body_cos"])) / 2
-    cols = [qt(raw["unique_words"]), body, raw["jsonld"], raw["heading_hierarchy"], qt(raw["struct_terms" + suffix]),
-            raw["list_table"], raw["emphasis"], raw["paragraph_length"]]
+
+def z_from_raw(raw, qts, flat=False) -> np.ndarray:
+    def qt(key, x):
+        x = np.asarray(x, dtype=np.float64)
+        if key in RAW_SCALE:
+            return np.clip(x, 0, 1)
+        return qts[key].transform(x.reshape(-1, 1)).ravel()
+
+    suffix = "_flat" if flat else ""
+    body = qt("body_terms", raw["body_terms" + suffix])
+    if "body_cos" in qts and raw.get("body_cos") is not None:
+        body = (body + qt("body_cos", raw["body_cos"])) / 2
+    cols = [qt("unique_words", raw["unique_words"]), body, raw["jsonld"], raw["heading_hierarchy"],
+            qt("struct_terms", raw["struct_terms" + suffix]), raw["list_table"], raw["emphasis"], raw["paragraph_length"]]
     return np.stack(cols, 1).astype(np.float32)
+
+
+def build_z(raw, train_mask, flat=False):
+    return z_from_raw(raw, fit_quantiles(raw, train_mask, flat), flat)
 
 
 def query_pca(dim, train_queries):
@@ -218,7 +244,7 @@ def main():
     train_q, val_q = set(split["train"]), set(split["val"])
     train_mask = np.isin(query_id, list(train_q))
     z = build_z(raw, train_mask)
-    z_idf = build_z(raw, train_mask, idf=True) if raw["body_terms_idf"] is not None else None
+    z_flat = build_z(raw, train_mask, flat=True) if raw["body_terms_flat"] is not None else None
 
     groups = defaultdict(list)
     for i, qid in enumerate(query_id.tolist()):
@@ -241,25 +267,25 @@ def main():
         "free 8 axes + PCA32": dict(cols=list(range(8)), pca=32),
         "free 8 axes, linear": dict(cols=list(range(8)), pca=0, linear=True),
     }
-    if z_idf is not None:
+    if z_flat is not None:
         variants.update({
-            "idf: #11 + #17": dict(cols=[1, 4], pca=0, idf=True),
-            "idf: free 8 axes + PCA16": dict(cols=list(range(8)), pca=16, idf=True),
+            "flat: #11 + #17": dict(cols=[1, 4], pca=0, flat=True),
+            "flat: free 8 axes + PCA16": dict(cols=list(range(8)), pca=16, flat=True),
         })
     pcas = {d: query_pca(d, train_ids) for d in {v["pca"] for v in variants.values()}}
     report = {"n": args.n, "cosine": raw["body_cos"] is not None, "variants": {}}
-    best_model = None
+    candidates = {}
     for name, v in variants.items():
         pq = pcas[v["pca"]]
-        zz = z_idf if v.get("idf") else z
+        zz = z_flat if v.get("flat") else z
         x = np.concatenate([zz[:, v["cols"]], np.stack([pq[q] for q in query_id.tolist()])], 1).astype(np.float32)
         runs = []
         for seed in range(args.seeds):
             model = train_head(x, ranks, scores, train_groups, val_groups, seed, linear=v.get("linear", False))
             res, _ = evaluate(model, x, ranks, val_groups, rel_eval)
             runs.append(res)
-            if name == "free 8 axes + PCA16" and seed == 0:
-                best_model = (model, x)
+            if name.startswith("free 8 axes") and "linear" not in name and seed == 0:
+                candidates[name] = (model, x, v["pca"])
         keys = [k for k in runs[0] if k != "relevant_only_n"]
         summary = {k: round(float(np.mean([r[k] for r in runs])), 4) for k in keys}
         summary.update({f"{k}_sd": round(float(np.std([r[k] for r in runs])), 4) for k in keys})
@@ -267,7 +293,14 @@ def main():
         report["variants"][name] = summary
         print(name, summary, f"({time.time() - start:.0f}s)", flush=True)
 
-    model, x = best_model
+    chosen = max(candidates, key=lambda k: report["variants"][k]["per_query_auc"])
+    model, x, pca_dim = candidates[chosen]
+    report["prescription_head"] = chosen
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    pq = pcas[pca_dim]
+    torch.save({"state_dict": model.state_dict(), "in_dim": x.shape[1], "pca_dim": pca_dim, "axes": AXES,
+                "pca_by_query": {q: v for q, v in pq.items()}}, OUT_DIR / f"r_head_top{args.n}.pt")
+    np.savez(OUT_DIR / f"z_top{args.n}.npz", z=z, query_id=query_id, chunk_id=chunk_id, ranks=ranks)
     base, _ = evaluate(model, x, ranks, val_groups, None)
     idx = np.concatenate(val_groups)
     rng = np.random.default_rng(0)
@@ -288,7 +321,6 @@ def main():
     report["val_axis_mean_by_band"] = {
         f"{a}-{b}": {axis: round(float(z[idx][(ranks[idx] >= a) & (ranks[idx] <= b), c].mean()), 3)
                      for c, axis in enumerate(AXES)} for a, b in bands}
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"report_top{args.n}{'_cos' if report['cosine'] else ''}.json"
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"-> {out} ({time.time() - start:.0f}s)")

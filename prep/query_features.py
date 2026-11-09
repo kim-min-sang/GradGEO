@@ -7,16 +7,16 @@ Query-side features (handoff §5.1, §6; strategy_schema.yaml v0.5).
            Passages are written in shards so an interrupted run resumes.
     axes   raw values of the query-dependent [Q] axes for every (query, passage) in
            the Top-N pool:
-             body_query_alignment (#11)        (a) share of query key terms in the passage
+             body_query_alignment (#11)        (a) idf-weighted share of query key terms in the passage
                                                (b) query-passage embedding cosine
-             structural_query_alignment (#17)  share of query key terms in each of title /
-                                               meta_description / headings / jsonld_text,
+             structural_query_alignment (#17)  idf-weighted share of query key terms in each of
+                                               title / meta_description / headings / jsonld_text,
                                                averaged with the engine's field weights
            Key terms = the query's Lucene tokens (Porter stem, Lucene English stopwords
-           removed), the same analysis as the BM25 index. Entities are not matched
-           separately. Quantile transforms are fitted later on the train split.
-           Diagnostic only (not in the schema): the same shares weighted by each term's
-           BM25 idf in the passage-unit index (*_idf), to see what the plain share loses.
+           removed), the same analysis as the BM25 index; each is weighted by its BM25 idf
+           in the passage-unit index (schema v0.5, revised 2026-11-08). Entities are not
+           matched separately. Quantile transforms are fitted later on the train split.
+           Diagnostic only: the unweighted shares (*_flat), the definition before the revision.
 
 Outputs under data/sageo/features/:
     embeddings/queries.npy, queries_ids.json
@@ -185,7 +185,7 @@ def run_axes(n: int):
     field_w = np.array(list(STRUCT_FIELDS.values()))
     query_id, chunk_id, body_cos = [], [], []
     cols = {k: [] for k in ("body_query_terms", "structural_query_terms",
-                            "body_query_terms_idf", "structural_query_terms_idf")}
+                            "body_query_terms_flat", "structural_query_terms_flat")}
     for r in rows:
         terms = set(tokens(queries[r["query_id"]]))
         flat = {t: 1.0 for t in terms}
@@ -195,7 +195,7 @@ def run_axes(n: int):
             d = doc_of(c)
             query_id.append(r["query_id"])
             chunk_id.append(c)
-            for suffix, w in (("", flat), ("_idf", weighted)):
+            for suffix, w in (("", weighted), ("_flat", flat)):
                 cols["body_query_terms" + suffix].append(share(terms, w, body[c]))
                 cover = [share(terms, w, struct[f].get(d, set())) for f in STRUCT_FIELDS]
                 cols["structural_query_terms" + suffix].append(float(np.dot(cover, field_w) / field_w.sum()))
