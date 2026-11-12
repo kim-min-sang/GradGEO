@@ -9,8 +9,9 @@ engine (C29, rag/retrieval.py --engine unit).
              candidate pools and a judging-cost estimate
     umbrela  LLM sample for ① and ④: 30 queries per dataset, up to 3 documents per
              rank band (1-100, 101-200, 201-300, 301-500; document rank = its best
-             passage), judged by gpt-5-mini with the UMBRELA prompt on title + meta
-             description + that best passage. Results are cached.
+             passage), judged with the UMBRELA prompt on title + meta description + that
+             best passage. Results are cached. The pre-check itself (2026-11) was judged
+             by gpt-5-mini; new calls use the model of configs/llm.yaml (C36).
 
 Usage:
     python prep/precheck.py stats
@@ -148,6 +149,7 @@ async def judge_all(items, out_path, concurrency=16):
 
     load_dotenv(ROOT / ".env.local")
     template = yaml.safe_load(open(PROMPT))["prefix_user"]
+    llm = yaml.safe_load(open(ROOT / "configs" / "llm.yaml"))
     client = AsyncOpenAI()
     done = set()
     if out_path.exists():
@@ -161,7 +163,8 @@ async def judge_all(items, out_path, concurrency=16):
             prompt = template.format(query=it["query"], passage=it["text"])
             for attempt in range(4):
                 try:
-                    resp = await client.responses.create(model="gpt-5-mini", input=[{"role": "user", "content": prompt}])
+                    resp = await client.responses.create(model=llm["model"], input=[{"role": "user", "content": prompt}],
+                                                         reasoning={"effort": llm["reasoning_effort"]["umbrela"]})
                     break
                 except Exception:
                     if attempt == 3:

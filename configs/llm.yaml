@@ -1,0 +1,15 @@
+# LLM 설정 (핸드오프 C36, 2026-11-12 연구자 확정)
+# gpt-5-mini(SAGEO가 쓴 모델)는 2026-12-11 종료라 모든 LLM 호출을 gpt-5.4-mini의 날짜 고정 버전으로 바꾼다.
+# 같은 mini 등급이고 종료 공지가 없으며, 날짜 고정이라 재현할 수 있다(gpt-5.6 terra·luna는 날짜 없는 이름만 있다).
+# 코드는 이 파일만 읽는다. strategy_schema.yaml의 judge.model·rewriter.model은 기록용으로 같은 값을 둔다.
+
+model: gpt-5.4-mini-2026-03-17
+
+# 추론 강도: SAGEO 설정을 gpt-5.4-mini의 선택지로 옮긴다(gpt-5.4-mini는 minimal이 없고 none이 가장 낮다).
+reasoning_effort:
+  generator: none    # SAGEO GE: gpt-5-mini effort minimal(가장 낮음) → 가장 낮은 none
+  rewriter: medium   # SAGEO optimizer: effort를 지정하지 않음 = gpt-5-mini 기본값 medium → medium을 명시
+  judge: medium      # 판정 LLM: gpt-5-mini 기본값으로 계획했던 것과 같게
+  umbrela: medium    # UMBRELA 관련성 판정: 사전 점검(gpt-5-mini 기본값)과 같게
+
+service_tier: flex   # 실시간 호출은 flex(배치와 같은 할인), 대량 호출은 Batch API

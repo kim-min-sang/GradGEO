@@ -4,14 +4,16 @@ far each one moves, starting from the level the Rewriter is shown.
 
     g        = sum_s (1 - p_s) * d logit_s / dz      (query embedding and head weights fixed)
     level_i  = the axis's current level (continuous axes: three bins, edges from the schema)
-    movable  = axes whose level can still move the way g_i points
+    movable  = axes whose level can still move the way g_i points; lowering only on axes
+               with `direction: both`, not under their `lower_floor` (schema v0.10, C37)
     share_i  = g_i / |g|  over all axes; axes with |share_i| >= tau are candidates,
                largest first, at most k_max
-    target_i = the level in g_i's direction (any number of steps) that maximizes
+    target_i = the allowed level in g_i's direction (any number of steps) that maximizes
                log p_final = sum_s log p_s, given the targets already chosen;
                the axis is dropped if no level raises it (k = 0 is allowed)
 
-The random prescription (§11.1) draws the same k: random axes, random other levels.
+The random prescription (§11.1) keeps everything but the choice of axes: the same k, drawn
+at random among the movable axes whose move raises log p_final, targets as above.
 """
 import numpy as np
 import torch
@@ -20,7 +22,11 @@ BINS = [0.0, 0.5, 1.0]
 
 
 def axis_levels(axis: dict) -> list[float]:
-    return BINS if axis["levels"] == "continuous" else [float(v) for v in axis["levels"]]
+    if axis["levels"] == "continuous":
+        return BINS
+    if axis["levels"] in ("count5", "reverse_count5"):  # sentence-count axes: five levels (the reverse only flips the rubric)
+        return [0.0, 0.25, 0.5, 0.75, 1.0]
+    return [float(v) for v in axis["levels"]]
 
 
 def nearest(levels, value) -> float:
@@ -60,14 +66,33 @@ def log_p_final(heads, query_part: np.ndarray):
     return f
 
 
+def allowed_levels(axis: dict, cur: float, g_i: float) -> list[float]:
+    """Levels the axis may move to the way g_i points (schema v0.10, C37): any level above for g_i > 0;
+    below only for `direction: both` axes and not under their `lower_floor`."""
+    levels = axis_levels(axis)
+    if g_i > 0:
+        return [v for v in levels if v > cur]
+    if g_i < 0 and axis.get("direction") == "both":
+        return [v for v in levels if axis.get("lower_floor", 0.0) <= v < cur]
+    return []
+
+
 def movable(g, z, axes) -> np.ndarray:
-    """1 where the axis can still move the way its gradient points, 0 where its level is already at the end."""
-    m = []
-    for i, axis in enumerate(axes):
-        levels = axis_levels(axis)
-        cur = level_of(axis, z[i])
-        m.append(0.0 if (g[i] > 0 and cur == max(levels)) or (g[i] < 0 and cur == min(levels)) else 1.0)
-    return np.array(m)
+    """1 where the axis may still move the way its gradient points, 0 where it is at the end or that way is not allowed."""
+    return np.array([1.0 if allowed_levels(axis, level_of(axis, z[i]), g[i]) else 0.0 for i, axis in enumerate(axes)])
+
+
+def target_level(i, g, z, zp, base, axes, objective, eps):
+    """(current level, best allowed level along g_i or None, its log p_final) with the other axes at zp."""
+    cur = level_of(axes[i], z[i])
+    best, best_lp = None, base
+    for v in sorted(allowed_levels(axes[i], cur, g[i]), key=lambda v: abs(v - cur)):
+        zc = zp.copy()
+        zc[i] = v
+        lp = objective(zc)
+        if lp > best_lp + eps:
+            best, best_lp = v, lp
+    return cur, best, best_lp
 
 
 def prescribe(g, z, axes, objective, tau=0.25, k_max=5, eps=1e-6):
@@ -79,26 +104,26 @@ def prescribe(g, z, axes, objective, tau=0.25, k_max=5, eps=1e-6):
     for i in np.argsort(-np.abs(share)):
         if abs(share[i]) < tau or len(plan) >= k_max:
             break
-        levels = axis_levels(axes[i])
-        cur = level_of(axes[i], z[i])
-        ahead = [v for v in levels if (v - cur) * g[i] > 0]
-        best, best_lp = None, base
-        for v in sorted(ahead, key=lambda v: abs(v - cur)):
-            zc = zp.copy()
-            zc[i] = v
-            lp = objective(zc)
-            if lp > best_lp + eps:
-                best, best_lp = v, lp
+        cur, best, best_lp = target_level(i, g, z, zp, base, axes, objective, eps)
         if best is not None:
             plan.append((int(i), cur, best, best_lp - base))
             zp[i], base = best, best_lp
     return plan
 
 
-def random_prescription(k, z, axes, rng):
-    picks = []
-    for i in rng.permutation(len(axes))[:k]:
-        cur = level_of(axes[i], z[i])
-        options = [v for v in axis_levels(axes[i]) if v != cur]
-        picks.append((int(i), cur, float(rng.choice(options)), None))
-    return picks
+def random_prescription(k, g, z, axes, objective, rng, eps=1e-6):
+    """prescribe with the axes drawn in random order instead of by |share| (no tau): the first k axes
+    whose allowed move along g raises log p_final, each with its target level chosen as in prescribe."""
+    m = movable(g, z, axes)
+    plan, zp = [], np.array(z, dtype=np.float64)
+    base = objective(zp)
+    for i in rng.permutation(len(axes)):
+        if len(plan) >= k:
+            break
+        if not m[i]:
+            continue
+        cur, best, best_lp = target_level(i, g, z, zp, base, axes, objective, eps)
+        if best is not None:
+            plan.append((int(i), cur, best, best_lp - base))
+            zp[i], base = best, best_lp
+    return plan

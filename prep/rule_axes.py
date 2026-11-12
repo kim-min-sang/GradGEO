@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "SAGEO_Arena"))
-from src.modules.utils.jsonld_extractor import filter_jsonld_for_generator  # noqa: E402
+from src.modules.utils.jsonld_extractor import DEFAULT_KEYS, JSONLD_WHITELIST, filter_jsonld_for_generator  # noqa: E402
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _LIST_ITEM = re.compile(r"^\s*([-*+]|\d+[.)])\s+\S")
@@ -116,7 +116,9 @@ def level_jsonld(jsonld) -> float:
         types = obj.get("@type")
         types = {types} if isinstance(types, str) else {t for t in types if isinstance(t, str)} if isinstance(types, list) else set()
         filled = [k for k, v in obj.items() if k not in ("@type", "@context", "@graph") and v not in (None, "", [], {})]
-        if types & JSONLD_CONTENT_TYPES and len(filled) >= 2:
+        content = types & JSONLD_CONTENT_TYPES
+        # 2 filled visible fields, or all of them for a type with one (FAQPage: mainEntity), schema v0.9
+        if content and len(filled) >= min(2, *(len(JSONLD_WHITELIST.get(t, DEFAULT_KEYS)) for t in content)):
             return 1.0
     return 0.5
 

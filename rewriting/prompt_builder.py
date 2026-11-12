@@ -1,8 +1,9 @@
 """
 Rewriter prompt (handoff §9.1, strategy_schema.yaml `rewriter`): query, the META block as
 the engine shows it, the representative passage, and one block per axis to change with
-its full rubric (current level ▶, target level ★) and its allow / forbid rules, then the
-global rules. Only the fields the chosen axes act on may change.
+its full rubric (current level ▶, target level ★) and its allow / forbid rules (`safety_down`
+when the target is below the current level, schema v0.10), then the global rules. Only the
+fields the chosen axes act on may change.
 """
 import json
 from pathlib import Path
@@ -46,15 +47,17 @@ def rubric_lines(axis: dict) -> dict[float, str]:
 def axis_block(axis_id: str, current: float, target: float) -> str:
     axis = AXES[axis_id]
     lines = [f"## {axis['name_en']} (you may change: {', '.join(axis_fields(axis_id))})"]
+    if axis.get("definition"):
+        lines.append(f"Definition: {axis['definition']}")
     for level, text in sorted(rubric_lines(axis).items()):
         mark = "★" if level == target else "▶" if level == current else " "
         lines.append(f"{mark} {text}")
-    safety = axis.get("safety") or {}
+    safety = (axis.get("safety_down") if target < current else axis.get("safety")) or {}
     if safety.get("allow"):
         lines.append("Allowed: " + " ".join(safety["allow"]))
     if safety.get("forbid"):
         lines.append("Forbidden: " + " ".join(safety["forbid"]))
-    if axis_id == "jsonld":
+    if "jsonld" in axis_fields(axis_id):
         from src.modules.utils.jsonld_extractor import JSONLD_WHITELIST
         lines.append("Only these fields of each type are visible to the engine: "
                      + "; ".join(f"{t}: {', '.join(f)}" for t, f in JSONLD_WHITELIST.items()))

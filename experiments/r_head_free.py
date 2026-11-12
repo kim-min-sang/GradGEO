@@ -7,11 +7,16 @@ Free axes (handoff numbering): #8 unique_words, #11 body_query_alignment,
 #19 emphasis, #20 paragraph_length. Continuous axes #8 and #11 are quantile-
 transformed with the train split; #11 = mean of its two transformed parts (key-term
 share, embedding cosine) when the cosine is available, else the key-term share alone.
-#17 is its raw share (schema v0.6).
+#17 is not quantile-transformed (schema v0.6): since v0.9 it is the mean over its four fields
+of min(share / 0.75, 1); diagnostic variants use the v0.8 value (mean of the raw shares) and
+the mean of discrete field levels (full >= 0.75, half > 0.25).
 The key-term shares of #11 and #17 are idf-weighted (schema v0.5, revised 2026-11-08);
 diagnostic variants marked "flat" use the unweighted shares (the earlier definition).
+Visibility mask (schema v0.10 `hidden_from`, C37): the "free axes" variants leave out the axes
+the BM25 stage cannot see (#15: the index drops heading tags; #19: the analyzer drops the
+markdown marks); one diagnostic variant keeps all 8.
 
-Train on the train split, report on the validation split (dev and test untouched):
+Train on the train split, report on the validation split (test untouched):
     pooled AUC         y_R over all validation (query, passage) pairs
     per-query AUC      the same inside each query, averaged (what the gradient uses)
     Spearman           logit vs. BM25 rank inside each query, averaged
@@ -20,8 +25,9 @@ Train on the train split, report on the validation split (dev and test untouched
     permutation importance of each axis (10 shuffles, pooled AUC drop)
 
 The head used for prescriptions (experiments/compare_mini.py) is the seed-0 model of
-the "free 8 axes" variant whose PCA size (0 / 16 / 32) has the best validation
-per-query AUC (handoff §6); it is saved with the z of every pool pair.
+the "free axes" variant whose PCA size (0 / 16 / 32) has the best validation
+per-query AUC (handoff §6); it is saved with its axes (columns of z) and the z of
+all 8 free axes for every pool pair.
 
 Usage:
     python experiments/r_head_free.py [--n 300] [--seeds 3]
@@ -35,6 +41,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
@@ -50,9 +57,11 @@ FEAT = DATA / "features"
 OUT_DIR = DATA / "r_head_free"
 AXES = ["#8 unique_words", "#11 body_query_alignment", "#14 jsonld", "#15 heading_hierarchy",
         "#17 structural_query_alignment", "#18 list_table", "#19 emphasis", "#20 paragraph_length"]
+SCHEMA_AXES = {a["id"]: a for a in yaml.safe_load(open(ROOT / "configs" / "strategy_schema.yaml", encoding="utf-8"))["strategies"]}
+R_COLS = [c for c, a in enumerate(AXES) if "R" not in SCHEMA_AXES[a.split()[1]].get("hidden_from", [])]  # visibility mask
 BOUNDARY = 100
-# #17 keeps its raw idf-weighted share (schema v0.6, 2026-11-09): its rubric names absolute
-# levels (none / some / all key terms), and the quantile scale called a share of 0.58 "all"
+# #17 keeps its own scale (schema v0.6, 2026-11-09; since v0.9 the mean of min(field share / 0.75, 1)): its
+# rubric names absolute levels (none / some / all key terms), and the quantile scale called a share of 0.58 "all"
 RAW_SCALE = {"struct_terms"}
 
 
@@ -79,6 +88,8 @@ def load(n):
         "jsonld": rule["jsonld"][idx],
         "heading_hierarchy": rule["heading_hierarchy"][idx],
         "struct_terms": q["structural_query_terms"],
+        "struct_terms_share": q["structural_query_terms_share"] if "structural_query_terms_share" in q.files else None,
+        "struct_field_shares": q["structural_field_shares"] if "structural_field_shares" in q.files else None,
         "list_table": rule["list_table"][idx],
         "emphasis": rule["emphasis"][idx],
         "paragraph_length": rule["paragraph_length"][idx],
@@ -245,6 +256,13 @@ def main():
     train_mask = np.isin(query_id, list(train_q))
     z = build_z(raw, train_mask)
     z_flat = build_z(raw, train_mask, flat=True) if raw["body_terms_flat"] is not None else None
+    z_alt = {}  # earlier #17 definitions, for comparison
+    if raw["struct_terms_share"] is not None:
+        z_alt["share"] = build_z({**raw, "struct_terms": raw["struct_terms_share"]}, train_mask)
+    if raw["struct_field_shares"] is not None:
+        s = raw["struct_field_shares"]
+        z_alt["levels"] = build_z({**raw, "struct_terms": np.where(s >= 0.75, 1.0, np.where(s > 0.25, 0.5, 0.0)).mean(1)},
+                                  train_mask)
 
     groups = defaultdict(list)
     for i, qid in enumerate(query_id.tolist()):
@@ -262,30 +280,35 @@ def main():
         "#17 only": dict(cols=[4], pca=0),
         "#11 only": dict(cols=[1], pca=0),
         "#11 + #17": dict(cols=[1, 4], pca=0),
-        "free 8 axes": dict(cols=list(range(8)), pca=0),
-        "free 8 axes + PCA16": dict(cols=list(range(8)), pca=16),
-        "free 8 axes + PCA32": dict(cols=list(range(8)), pca=32),
-        "free 8 axes, linear": dict(cols=list(range(8)), pca=0, linear=True),
+        "free axes": dict(cols=R_COLS, pca=0),
+        "free axes + PCA16": dict(cols=R_COLS, pca=16),
+        "free axes + PCA32": dict(cols=R_COLS, pca=32),
+        "free axes, linear": dict(cols=R_COLS, pca=0, linear=True),
+        "free 8 axes + PCA32, no visibility mask": dict(cols=list(range(8)), pca=32),
     }
     if z_flat is not None:
         variants.update({
             "flat: #11 + #17": dict(cols=[1, 4], pca=0, flat=True),
-            "flat: free 8 axes + PCA16": dict(cols=list(range(8)), pca=16, flat=True),
+            "flat: free axes + PCA16": dict(cols=R_COLS, pca=16, flat=True),
         })
+    for alt, label in (("share", "v0.8 #17 (mean share)"), ("levels", "#17 as mean of field levels")):
+        if alt in z_alt:
+            variants.update({f"{label}: #17 only": dict(cols=[4], pca=0, alt=alt),
+                             f"{label}: free axes + PCA32": dict(cols=R_COLS, pca=32, alt=alt)})
     pcas = {d: query_pca(d, train_ids) for d in {v["pca"] for v in variants.values()}}
     report = {"n": args.n, "cosine": raw["body_cos"] is not None, "variants": {}}
     candidates = {}
     for name, v in variants.items():
         pq = pcas[v["pca"]]
-        zz = z_flat if v.get("flat") else z
+        zz = z_flat if v.get("flat") else z_alt[v["alt"]] if v.get("alt") else z
         x = np.concatenate([zz[:, v["cols"]], np.stack([pq[q] for q in query_id.tolist()])], 1).astype(np.float32)
         runs = []
         for seed in range(args.seeds):
             model = train_head(x, ranks, scores, train_groups, val_groups, seed, linear=v.get("linear", False))
             res, _ = evaluate(model, x, ranks, val_groups, rel_eval)
             runs.append(res)
-            if name.startswith("free 8 axes") and "linear" not in name and seed == 0:
-                candidates[name] = (model, x, v["pca"])
+            if name.startswith("free axes") and "linear" not in name and seed == 0:
+                candidates[name] = (model, x, v["pca"], v["cols"])
         keys = [k for k in runs[0] if k != "relevant_only_n"]
         summary = {k: round(float(np.mean([r[k] for r in runs])), 4) for k in keys}
         summary.update({f"{k}_sd": round(float(np.std([r[k] for r in runs])), 4) for k in keys})
@@ -294,18 +317,19 @@ def main():
         print(name, summary, f"({time.time() - start:.0f}s)", flush=True)
 
     chosen = max(candidates, key=lambda k: report["variants"][k]["per_query_auc"])
-    model, x, pca_dim = candidates[chosen]
+    model, x, pca_dim, cols = candidates[chosen]
+    head_axes = [AXES[c] for c in cols]
     report["prescription_head"] = chosen
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     pq = pcas[pca_dim]
-    torch.save({"state_dict": model.state_dict(), "in_dim": x.shape[1], "pca_dim": pca_dim, "axes": AXES,
-                "pca_by_query": {q: v for q, v in pq.items()}}, OUT_DIR / f"r_head_top{args.n}.pt")
-    np.savez(OUT_DIR / f"z_top{args.n}.npz", z=z, query_id=query_id, chunk_id=chunk_id, ranks=ranks)
+    torch.save({"state_dict": model.state_dict(), "in_dim": x.shape[1], "pca_dim": pca_dim, "axes": head_axes,
+                "cols": cols, "pca_by_query": {q: v for q, v in pq.items()}}, OUT_DIR / f"r_head_top{args.n}.pt")
+    np.savez(OUT_DIR / f"z_top{args.n}.npz", z=z, axes=AXES, query_id=query_id, chunk_id=chunk_id, ranks=ranks)
     base, _ = evaluate(model, x, ranks, val_groups, None)
     idx = np.concatenate(val_groups)
     rng = np.random.default_rng(0)
     importance = {}
-    for c, axis in enumerate(AXES):
+    for c, axis in enumerate(head_axes):
         drops = []
         for _ in range(10):
             xp = x.copy()

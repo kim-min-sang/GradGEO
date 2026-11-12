@@ -1,26 +1,29 @@
 """
-Mini comparison on the retrieval layer (dev split), before the reranker cache and GE
+Mini comparison on the retrieval layer (val_mini: the half of the validation split that
+was the dev split before C33), before the reranker cache and GE
 runs exist. The same rewrites can later be scored by the reranker on the GPU server.
 
-    targets   dev queries: one UMBRELA-relevant (>= 2) document whose best passage is
+    targets   val_mini queries: one UMBRELA-relevant (>= 2) document whose best passage is
               ranked 101-300 by the passage-unit engine (C29), tried in seeded random
               order, at most 6 judgments per query; documents with more passages than
               the corpus p99 are skipped (handoff §10.4). p* = its best-ranked passage
               (§8.1). UMBRELA text = title + meta description + p*, as in prep/precheck.py.
     rewrite   --method
-                stage_aware, content_improvement   SAGEO protocol: whole document,
+                stage_aware, autogeo, content_improvement   SAGEO protocol: whole document,
                     scope all, the method's original prompt, SAGEO's DocumentOptimizer
-                    (gpt-5-mini, flex tier with fallback), one call per target
-                stage_aware_q   StageAware with "Target query: {q}" and one sentence
-                    asking to optimize for it put in front of the original prompt (§11.2)
+                    (configs/llm.yaml model, flex tier with fallback), one call per target
+                stage_aware_q, autogeo_q   the method with "Target query: {q}" and one
+                    sentence asking to optimize for it put in front of its original prompt (§11.2)
                 gradgeo_r   GradGEO with the free-axis R head only (experiments/r_head_free.py):
                     gradient at p* picks the axes, the head picks each target level
                     from the current level (optimization/gradient_strategy.py, §8.2 C32),
                     schema Rewriter on p* + the fields of the chosen axes (§9)
-                random      same k as gradgeo_r, axes and target levels drawn at random (§11.1)
+                random      gradgeo_r with the axes drawn at random instead of by gradient share:
+                    same k, among the axes whose allowed move raises the head's p, target
+                    levels from the head (§11.1, C37)
               gradgeo_r and random use the schema's Rewriter text and need --schema_reviewed
               (handoff §15 step 0). Prescription settings here are placeholders until the
-              dev intervention gate sets them: tau 0.25, k_max 5.
+              intervention check on the validation split sets them: tau 0.25, k_max 5.
     evaluate  each rewritten document d' is processed like the index (SAGEO
               preprocess_document with the environment-B chunker); every d' passage is
               scored with the B1 formula (per-field BM25 summed, collection statistics of
@@ -33,6 +36,13 @@ runs exist. The same rewrites can later be scored by the reranker on the GPU ser
               the R head's p before and after; query-term density (query-term tokens per
               100 tokens) of that passage and of the four structural fields. Check: the
               unchanged document reproduces z(p*).
+    rerank_pairs  reranker input for the GPU job (part "mini" of rag/reranking.py): the
+              original Top-100 of every target query, and each passage of each d' whose B1
+              score reaches the 100th of them (a superset of the passages that enter).
+    rerank_eval   with the job's scores: the B1 Top-100 after d' replaces d (ties go to
+              d', as in evaluate), reordered by reranker score; d's rerank rank = its best
+              passage's position. Reports Rerank H@10 (passage in the reranked Top-10, as
+              SAGEO's evaluate.py) per method.
 
 Outputs under data/sageo/compare_mini/.
 
@@ -43,6 +53,8 @@ Usage:
     python experiments/compare_mini.py rewrite --method gradgeo_r --schema_reviewed
     python experiments/compare_mini.py evaluate
     python experiments/compare_mini.py shift
+    python experiments/compare_mini.py rerank_pairs
+    python experiments/compare_mini.py rerank_eval --scores data/sageo/rerank_job/out
 """
 import argparse
 import asyncio
@@ -68,11 +80,24 @@ META_FIELDS = ["title", "meta_description", "headings", "jsonld_text"]
 BAND = (101, 300)
 MAX_TRIES = 6
 SEED = 42
-SAGEO_METHODS = ["stage_aware", "stage_aware_q", "content_improvement"]
+SAGEO_METHODS = ["stage_aware", "stage_aware_q", "autogeo", "autogeo_q", "content_improvement"]
 GRAD_METHODS = ["gradgeo_r", "random"]
 FREE_AXES = ["unique_words", "body_query_alignment", "jsonld", "heading_hierarchy",
              "structural_query_alignment", "list_table", "emphasis", "paragraph_length"]  # = r_head_free.AXES
 QUERY_PREFIX = "Target query: {query}\nOptimize the document for this target query.\n\n"
+LLM_CONFIG = ROOT / "configs" / "llm.yaml"  # model and reasoning effort of every call (handoff C36)
+
+
+def configure(optimizer):
+    """SAGEO's DocumentOptimizer on the model of configs/llm.yaml with the Rewriter's reasoning
+    effort: SAGEO passes none, which on gpt-5-mini meant its default, medium."""
+    import functools
+    import yaml
+    llm = yaml.safe_load(open(LLM_CONFIG))
+    optimizer.model = llm["model"]
+    optimizer.client.responses.parse = functools.partial(
+        optimizer.client.responses.parse, reasoning={"effort": llm["reasoning_effort"]["rewriter"]})
+    return optimizer
 
 
 def doc_of(chunk_id: str) -> str:
@@ -108,12 +133,12 @@ def load_passages(chunk_ids) -> dict[str, str]:
     return texts
 
 
-def dev_results() -> dict[int, list]:
-    dev = set(json.loads((DATA / "split.json").read_text())["dev"])
+def mini_results() -> dict[int, list]:
+    mini = set(json.loads((DATA / "split.json").read_text())["val_mini"])
     rows = {}
     for line in open(DATA / "retrieval_b_unit" / "unit_top500.jsonl", encoding="utf-8"):
         r = json.loads(line)
-        if r["query_id"] in dev:
+        if r["query_id"] in mini:
             rows[r["query_id"]] = r["results"]
     return rows
 
@@ -125,7 +150,7 @@ def run_targets():
 
     OUT.mkdir(parents=True, exist_ok=True)
     queries = load_queries()
-    rows = dev_results()
+    rows = mini_results()
     rng = random.Random(SEED)
     candidates = {}
     for qid in sorted(rows):
@@ -177,7 +202,7 @@ def run_targets():
         for qid in sorted(targets):
             f.write(json.dumps(targets[qid]) + "\n")
     per_ds = Counter(t["dataset"] for t in targets.values())
-    print(f"{len(targets)} targets from {len(rows)} dev queries, p99 passages per document = {p99}")
+    print(f"{len(targets)} targets from {len(rows)} val_mini queries, p99 passages per document = {p99}")
     print("per dataset:", dict(sorted(per_ds.items())))
     print("UMBRELA tokens this run:", usage_total)
 
@@ -193,7 +218,7 @@ def run_sageo_rewrite(method: str, concurrency: int = 12):
     load_dotenv(ROOT / ".env.local")
     from src.modules.optimizer import DocumentOptimizer
     from src.modules.utils import sageo_methods
-    from src.modules.utils.sageo_methods import TARGET_FIELDS_ALL, StageAware
+    from src.modules.utils.sageo_methods import TARGET_FIELDS_ALL
 
     usage_var = contextvars.ContextVar("usage")
 
@@ -209,17 +234,18 @@ def run_sageo_rewrite(method: str, concurrency: int = 12):
     done = {json.loads(line)["query_id"] for line in open(out_path)} if out_path.exists() else set()
     todo = [t for t in targets if t["query_id"] not in done]
     docs = load_documents({t["doc_id"] for t in todo})
-    optimizer = Optimizer()
+    optimizer = configure(Optimizer())
     sem = asyncio.Semaphore(concurrency)
     start = time.time()
 
     async def one(t, out):
         name = method
-        if method == "stage_aware_q":
+        if method.endswith("_q"):
+            base = sageo_methods.GEO_METHODS[method[:-2]]
             q = queries[t["query_id"]]["text"].replace("{", "{{").replace("}", "}}")
-            name = f"stage_aware_q_{t['query_id']}"
-            cls = type(name, (StageAware,), {"name": name, "prompt_template_all":
-                                              QUERY_PREFIX.format(query=q) + StageAware.prompt_template_all})
+            name = f"{method}_{t['query_id']}"
+            cls = type(name, (base,), {"name": name, "prompt_template_all":
+                                       QUERY_PREFIX.format(query=q) + base.prompt_template_all})
             sageo_methods.GEO_METHODS[name] = cls
         async with sem:
             usage_var.set([])
@@ -296,23 +322,27 @@ def run_prescriptions():
     head.eval()
     zf = np.load(DATA / "r_head_free" / "z_top300.npz")
     row = {(int(q), c): i for i, (q, c) in enumerate(zip(zf["query_id"], zf["chunk_id"]))}
-    axes = [AXES[a] for a in FREE_AXES]
+    head_axes = [FREE_AXES[c] for c in saved["cols"]]  # the axes the R stage can see (visibility mask, C37)
+    axes = [AXES[a] for a in head_axes]
     out = []
     for t in load_targets():
-        z = zf["z"][row[(t["query_id"], t["p_star"])]].astype(np.float64)
+        z_all = zf["z"][row[(t["query_id"], t["p_star"])]].astype(np.float64)
+        z = z_all[saved["cols"]]
         x = np.concatenate([z, saved["pca_by_query"][t["query_id"]]])
         g = gradient([head], x, len(z))
-        rec = {"query_id": t["query_id"], "z": z.round(3).tolist(), "g": g.round(4).tolist()}
-        grad = prescribe(g, z, axes, log_p_final([head], x[len(z):]))
-        rand = random_prescription(len(grad), z, axes, np.random.default_rng([SEED, t["query_id"]]))
-        rec["gradgeo_r"] = [(FREE_AXES[i], c, v, gain) for i, c, v, gain in grad]
-        rec["random"] = [(FREE_AXES[i], c, v, None) for i, c, v, _ in rand]
+        objective = log_p_final([head], x[len(z):])
+        rec = {"query_id": t["query_id"], "z": z_all.round(3).tolist(), "g": dict(zip(head_axes, g.round(4).tolist()))}
+        grad = prescribe(g, z, axes, objective)
+        rand = random_prescription(len(grad), g, z, axes, objective, np.random.default_rng([SEED, t["query_id"]]))
+        rec["gradgeo_r"] = [(head_axes[i], c, v, gain) for i, c, v, gain in grad]
+        rec["random"] = [(head_axes[i], c, v, gain) for i, c, v, gain in rand]
         out.append(rec)
     (OUT / "prescriptions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in out))
     levels = {a["id"]: axis_levels(a) for a in axes}
-    steps = Counter((a, abs(levels[a].index(v) - levels[a].index(c))) for r in out for a, c, v, _ in r["gradgeo_r"])
-    print(f"gradgeo_r: k distribution {dict(sorted(Counter(len(r['gradgeo_r']) for r in out).items()))}, "
-          f"(axis, levels moved) {dict(sorted(steps.items()))}")
+    for m in GRAD_METHODS:
+        steps = Counter((a, levels[a].index(v) - levels[a].index(c)) for r in out for a, c, v, _ in r[m])
+        print(f"{m}: k distribution {dict(sorted(Counter(len(r[m]) for r in out).items()))}, "
+              f"(axis, levels moved, negative = down) {dict(sorted(steps.items()))}")
 
 
 def run_grad_rewrite(method: str, concurrency: int = 16):
@@ -340,7 +370,7 @@ def run_grad_rewrite(method: str, concurrency: int = 16):
     todo = [targets[q] for q in sorted(targets) if q not in done]
     docs = load_documents({t["doc_id"] for t in todo})
     texts = load_passages({t["p_star"] for t in todo})
-    optimizer = DocumentOptimizer()
+    optimizer = configure(DocumentOptimizer())
     sem = asyncio.Semaphore(concurrency)
     start = time.time()
 
@@ -416,11 +446,15 @@ class B1Scorer:
         self.preprocess = retriever_bm25.preprocess_document
         self.fields = {f: bm25calc.Field(UNIT_INDEX, f) for f in ["contents"] + META_FIELDS}
 
-    def passage_scores(self, query: str, doc: dict) -> list[float]:
+    def passages(self, query: str, doc: dict) -> list[tuple[str, float]]:
+        """(text, B1 score) of every body passage of doc."""
         p = self.preprocess(doc, 0)
         qc = self.bc.query_counts(query)
         meta = sum(self.fields[f].score(qc, self.bc.tokens(p[f][1])) for f in META_FIELDS)
-        return [meta + self.fields["contents"].score(qc, self.bc.tokens(text)) for _, text in p["body_text"]]
+        return [(text, meta + self.fields["contents"].score(qc, self.bc.tokens(text))) for _, text in p["body_text"]]
+
+    def passage_scores(self, query: str, doc: dict) -> list[float]:
+        return [score for _, score in self.passages(query, doc)]
 
 
 def apply_fields(doc: dict, fields: dict) -> dict:
@@ -436,7 +470,7 @@ def run_evaluate():
 
     queries = load_queries()
     targets = {t["query_id"]: t for t in load_targets()}
-    rows = dev_results()
+    rows = mini_results()
     docs = load_documents({t["doc_id"] for t in targets.values()})
     scorer = B1Scorer()
     methods = sorted(p.stem.replace("rewrites_", "") for p in OUT.glob("rewrites_*.jsonl"))
@@ -504,7 +538,7 @@ def run_shift():
     from models.stage_heads import StageHead
     from optimization.gradient_strategy import level_of
     from prep import rule_axes as ra
-    from prep.query_features import EMB_DIR, Embedder
+    from prep.query_features import EMB_DIR, Embedder, structural_value
     from rewriting.prompt_builder import AXES
 
     scorer = B1Scorer()
@@ -562,7 +596,7 @@ def run_shift():
                          "raw": {"unique_words": ra.mtld(text), "body_terms": share(terms, body_tok),
                                  "jsonld": ra.level_jsonld(d2.get("jsonld")),
                                  "heading_hierarchy": ra.level_heading_hierarchy(d2.get("headings")),
-                                 "struct_terms": float(np.mean([share(terms, meta_tok[f]) for f in META_FIELDS])),
+                                 "struct_terms": structural_value([share(terms, meta_tok[f]) for f in META_FIELDS]),
                                  "list_table": ra.level_list_table(ra.count_list_table(text)),
                                  "emphasis": ra.level_emphasis(ra.count_emphasis(text)),
                                  "paragraph_length": ra.level_paragraph_length(ra.longest_paragraph_sentences(text))},
@@ -574,7 +608,7 @@ def run_shift():
     raw = {k: np.array([r["raw"][k] for r in recs], dtype=np.float64) for k in recs[0]["raw"]}
     raw["body_cos"] = np.array([v @ q_vec[r["query_id"]] for v, r in zip(vecs, recs)])
     z_after = z_from_raw(raw, qts)
-    x = np.concatenate([z_after, np.stack([saved["pca_by_query"][r["query_id"]] for r in recs])], 1)
+    x = np.concatenate([z_after[:, saved["cols"]], np.stack([saved["pca_by_query"][r["query_id"]] for r in recs])], 1)
     with torch.no_grad():
         p_after = torch.sigmoid(head(torch.tensor(x, dtype=torch.float32))).numpy().ravel()
 
@@ -625,10 +659,108 @@ def run_shift():
     print(json.dumps(summary, indent=1))
 
 
+# ---------------------------------------------------------------- reranker (scores from the GPU job)
+
+class RerankSetup:
+    """Targets, rewrites and the original Top-100 of the other documents, shared by both steps."""
+
+    def __init__(self):
+        self.queries = load_queries()
+        self.targets = load_targets()
+        rows = mini_results()
+        self.docs = load_documents({t["doc_id"] for t in self.targets})
+        self.scorer = B1Scorer()
+        self.methods = sorted(p.stem.replace("rewrites_", "") for p in OUT.glob("rewrites_*.jsonl"))
+        self.rewrites = {m: {r["query_id"]: r for r in map(json.loads, open(OUT / f"rewrites_{m}.jsonl"))}
+                         for m in self.methods}
+        # the targets rank 101-300, so none of their passages is in the original Top-100
+        self.top = {t["query_id"]: [(c, s) for c, s in rows[t["query_id"]] if doc_of(c) != t["doc_id"]][:100]
+                    for t in self.targets}
+
+    def new_passages(self, t, method) -> list[tuple[str, str, float]]:
+        """(key, text, B1 score) of the passages of d' for this method; [] when the rewrite failed."""
+        r = self.rewrites[method].get(t["query_id"])
+        if r is None or not r["ok"]:
+            return []
+        d2 = apply_fields(self.docs[t["doc_id"]], r["fields"])
+        q = self.queries[t["query_id"]]["text"]
+        return [(f"{t['query_id']}|{method}|{i}", text, s) for i, (text, s) in enumerate(self.scorer.passages(q, d2))]
+
+
+def run_rerank_pairs():
+    from rag import reranking
+
+    fmt = reranking.format_passage()
+    setup = RerankSetup()
+    chunks = {c for top in setup.top.values() for c, _ in top}
+    texts = load_passages(chunks)
+    others = reranking.load_documents({doc_of(c) for c in chunks})
+    rows = []
+    for t in setup.targets:
+        qid = t["query_id"]
+        q = setup.queries[qid]["text"]
+        rows += [{"key": f"{qid}|{c}", "query_id": qid, "doc": doc_of(c), "query": q,
+                  "passage": fmt(others[doc_of(c)], texts[c])} for c, _ in setup.top[qid]]
+        cut = setup.top[qid][-1][1]
+        for m in setup.methods:
+            r = setup.rewrites[m].get(qid)
+            new = setup.new_passages(t, m)
+            if new:
+                d2 = apply_fields(setup.docs[t["doc_id"]], r["fields"])
+            rows += [{"key": key, "query_id": qid, "doc": f"{t['doc_id']}|{m}", "query": q, "passage": fmt(d2, text)}
+                     for key, text, s in new if s >= cut]
+    reranking.write_part("mini", rows)
+    print(f"mini: {len(rows):,} pairs ({sum('|' in r['doc'] for r in rows):,} from rewrites); "
+          f"{reranking.token_stats(rows)}")
+
+
+def run_rerank_eval(scores_dir: str):
+    from rag import reranking
+
+    scores = reranking.load_scores(Path(scores_dir))
+    setup = RerankSetup()
+    per_target = []
+    for t in setup.targets:
+        qid = t["query_id"]
+        rec = {"query_id": qid, "dataset": t["dataset"]}
+        for m in setup.methods:
+            new = [(s, 0, key) for key, _, s in setup.new_passages(t, m)]
+            merged = sorted([(s, 1, f"{qid}|{c}") for c, s in setup.top[qid]] + new, key=lambda x: (-x[0], x[1]))[:100]
+            if not any(old == 0 for _, old, _ in merged):
+                rec[m] = {"top100": False, "rerank_rank": None}
+                continue
+            missing = [key for _, _, key in merged if key not in scores]
+            if missing:
+                sys.exit(f"no reranker score for {len(missing)} passages, e.g. {missing[0]}")
+            order = sorted(merged, key=lambda x: -scores[x[2]])  # stable: B1 order on equal scores
+            rec[m] = {"top100": True, "rerank_rank": 1 + next(i for i, (_, old, _) in enumerate(order) if old == 0)}
+        per_target.append(rec)
+
+    n = len(per_target)
+    summary = {"targets": n, "orig": {"Rerank H@10": 0.0}}
+    for m in setup.methods:
+        ranks = [r[m]["rerank_rank"] for r in per_target if r[m]["top100"]]
+        summary[m] = {
+            "BM25 H@100": round(len(ranks) / n, 3),
+            "Rerank H@10": round(sum(k <= 10 for k in ranks) / n, 3),
+            "Rerank H@10 within Top-100": round(sum(k <= 10 for k in ranks) / len(ranks), 3) if ranks else None,
+            "median rerank rank within Top-100": statistics.median(ranks) if ranks else None,
+        }
+    by_ds = defaultdict(lambda: defaultdict(list))
+    for r in per_target:
+        for m in setup.methods:
+            by_ds[r["dataset"]][m].append(bool(r[m]["top100"] and r[m]["rerank_rank"] <= 10))
+    summary["Rerank H@10_by_dataset"] = {ds: {m: f"{sum(v)}/{len(v)}" for m, v in ms.items()} for ds, ms in sorted(by_ds.items())}
+    (OUT / "rerank_eval_per_target.jsonl").write_text("".join(json.dumps(r) + "\n" for r in per_target))
+    (OUT / "rerank_eval_summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=1))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("step", choices=["targets", "prescribe", "rewrite", "evaluate", "shift"])
+    parser.add_argument("step", choices=["targets", "prescribe", "rewrite", "evaluate", "shift", "rerank_pairs", "rerank_eval"])
     parser.add_argument("--method", choices=SAGEO_METHODS + GRAD_METHODS)
+    parser.add_argument("--scores", help="rerank_eval: folder with the reranker job's output")
     parser.add_argument("--schema_reviewed", action="store_true",
                         help="the researcher has reviewed configs/strategy_schema.yaml (handoff §15 step 0)")
     args = parser.parse_args()
@@ -645,6 +777,10 @@ def main():
         run_sageo_rewrite(args.method)
     elif args.step == "evaluate":
         run_evaluate()
+    elif args.step == "rerank_pairs":
+        run_rerank_pairs()
+    elif args.step == "rerank_eval":
+        run_rerank_eval(args.scores)
     else:
         run_shift()
 

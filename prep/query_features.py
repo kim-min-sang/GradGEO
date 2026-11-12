@@ -11,7 +11,10 @@ Query-side features (handoff §5.1, §6; strategy_schema.yaml v0.5).
                                                (b) query-passage embedding cosine
              structural_query_alignment (#17)  idf-weighted share of query key terms in each of
                                                title / meta_description / headings / jsonld_text,
-                                               averaged with the engine's field weights
+                                               each scored min(share / 0.75, 1) and averaged with the
+                                               engine's field weights (schema v0.9: 1.0 only when every
+                                               field is full); *_share keeps the v0.5-v0.8 value (mean
+                                               of the shares), structural_field_shares the four shares
            Key terms = the query's Lucene tokens (Porter stem, Lucene English stopwords
            removed), the same analysis as the BM25 index; each is weighted by its BM25 idf
            in the passage-unit index (schema v0.5, revised 2026-11-08). Entities are not
@@ -51,6 +54,17 @@ BATCH = 32  # larger batches fail on the 8 GB card under WSL
 
 def doc_of(chunk_id: str) -> str:
     return chunk_id.rsplit("_chunk_", 1)[0]
+
+
+FULL_SHARE = 0.75  # #17: a structural field holding this share of the key-term weight is full (schema v0.9)
+
+
+def structural_value(covers) -> float:
+    """#17 value (schema v0.9): each field scores min(share / 0.75, 1); the value is their
+    engine-weighted mean, so it reaches 1.0 only when every field is full and keeps the
+    shares below that (level edges 0.33 / 0.999 in the schema)."""
+    w = np.array(list(STRUCT_FIELDS.values()))
+    return float(np.dot(np.minimum(np.asarray(covers) / FULL_SHARE, 1.0), w) / w.sum())
 
 
 def load_queries() -> dict[int, str]:
@@ -184,8 +198,8 @@ def run_axes(n: int):
 
     field_w = np.array(list(STRUCT_FIELDS.values()))
     query_id, chunk_id, body_cos = [], [], []
-    cols = {k: [] for k in ("body_query_terms", "structural_query_terms",
-                            "body_query_terms_flat", "structural_query_terms_flat")}
+    cols = {k: [] for k in ("body_query_terms", "structural_query_terms", "structural_query_terms_share",
+                            "structural_field_shares", "body_query_terms_flat", "structural_query_terms_flat")}
     for r in rows:
         terms = set(tokens(queries[r["query_id"]]))
         flat = {t: 1.0 for t in terms}
@@ -198,7 +212,12 @@ def run_axes(n: int):
             for suffix, w in (("", weighted), ("_flat", flat)):
                 cols["body_query_terms" + suffix].append(share(terms, w, body[c]))
                 cover = [share(terms, w, struct[f].get(d, set())) for f in STRUCT_FIELDS]
-                cols["structural_query_terms" + suffix].append(float(np.dot(cover, field_w) / field_w.sum()))
+                if suffix:
+                    cols["structural_query_terms_flat"].append(float(np.dot(cover, field_w) / field_w.sum()))
+                else:
+                    cols["structural_query_terms"].append(structural_value(cover))
+                    cols["structural_query_terms_share"].append(float(np.dot(cover, field_w) / field_w.sum()))
+                    cols["structural_field_shares"].append(cover)
         if have_emb:
             body_cos.extend(p_vecs[[p_row[c] for c in cids]].astype(np.float32) @ q_vec[r["query_id"]])
     out = {"query_id": np.array(query_id), "chunk_id": np.array(chunk_id),
