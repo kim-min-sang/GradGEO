@@ -225,7 +225,7 @@ def run_sageo_rewrite(method: str, concurrency: int = 12):
     class Optimizer(DocumentOptimizer):
         async def _call_api_with_flex(self, prompt, output_format):
             response = await super()._call_api_with_flex(prompt, output_format)
-            usage_var.get().append((response.usage.input_tokens, response.usage.output_tokens))
+            usage_var.get().append((response.usage.input_tokens, response.usage.output_tokens, response.service_tier))
             return response
 
     queries = load_queries()
@@ -390,7 +390,7 @@ def run_grad_rewrite(method: str, concurrency: int = 16):
         async with sem:
             try:
                 response = await optimizer._call_api_with_flex(prompt, Patch)
-                rec["usage"].append((response.usage.input_tokens, response.usage.output_tokens))
+                rec["usage"].append((response.usage.input_tokens, response.usage.output_tokens, response.service_tier))
                 patch = response.output_parsed
                 fields, notes = {}, []
                 if "passage" in allowed and patch.passage:

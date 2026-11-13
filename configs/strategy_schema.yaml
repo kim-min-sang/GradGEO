@@ -1,12 +1,17 @@
-# GradGEO 전략 스키마 — v0.10 (2026-11-12)
+# GradGEO 전략 스키마 — v0.11 (2026-11-13, 작성 중)
 #
 # z ∈ [0,1]^20 후보 축의 정의. 축 번호(#1~#20)는 핸드오프 §5.1 표 번호이고 이 파일의 나열 순서와 다르다.
 # z의 인덱스는 코드가 id 목록으로 정한다(예: experiments/r_head_free.py AXES).
 # 20개는 "후보 풀"이다. 정제 절차(refinement)를 데이터에 적용해 최종 K ≤ 12로 줄인다.
 #
 # 영어 문장이 판정 LLM과 Rewriter 프롬프트에 그대로 들어가는 정본이다(코퍼스가 영어).
-# 한국어는 바로 위 주석으로 단 검토용 번역이다. 이전 판: configs/archive/strategy_schema_v0.9.yaml, v0.8.yaml, v0.7.yaml, v0.4.yaml, v0.3.yaml, v0.2.yaml
+# 한국어는 바로 위 주석으로 단 검토용 번역이다. 이전 판: configs/archive/strategy_schema_v0.10.yaml, v0.9.yaml, v0.8.yaml, v0.7.yaml, v0.4.yaml, v0.3.yaml, v0.2.yaml
 # 파이프라인 쪽 결정(학습 단위, 레이블, 대표 passage, 재작성 범위, 비교 방법)은 docs/GradGEO_Handoff_v2.2_2026-11-05.md
+#
+# v0.11 수정 (2026-11-13, 작성 중) — 미니 시험(gpt-5.4-mini)에서 처방 수준에 못 미친 축의 Rewriter 문장
+#   - unique_words(#8) 내리기(사용자 확정): 56건 중 3건만 도달, Rewriter가 오히려 동의어로 바꿔 씀(records → documentation).
+#     목표 문장 0.0을 중립적으로("쉽고 일관된 표현"), safety_down 허용·금지를 구체적으로, 공통 규칙의 반복 금지에는
+#     "같은 대상 같은 단어"만 좁은 예외(질의어 반복은 여전히 금지), lower_floor 0.5(1.0 → 0.5만).
 #
 # v0.10 수정 (2026-11-12 사용자 확정, 핸드오프 C37)
 #   - 처방 방향(direction): 축마다 up(올리기만) 또는 both(양방향). 기준은 두 질문 — 내리려면 이미 있는 사실을 지워야 하나
@@ -138,7 +143,7 @@
 #   - 질의 측면 포괄성 [Q]: SAGEO 질의는 대부분 한 가지만 묻고, 드러나지 않은 측면은 LLM이 측면 목록을 만들어야 해서
 #     운 요소가 생긴다. passage가 256토큰이라 여러 측면을 담기도 어렵다(2026-11-04 사용자 결정).
 
-version: "0.10"               # 문자열(숫자면 0.1로 읽힌다)
+version: "0.11"               # 문자열(숫자면 0.1로 읽힌다)
 
 judge:
   model: gpt-5.4-mini-2026-03-17   # = configs/llm.yaml(코드는 그 파일을 읽는다, C36). 이전: gpt-5-mini(2026-12-11 종료)
@@ -504,6 +509,9 @@ strategies:
     editable: true
     # 양방향(C37): 사실을 지우지 않고 내릴 수 있고, 내린 상태도 흔한 작성 방식이다
     direction: both
+    # v0.11: 0.5 아래로 내리지 않는다. 0.0 = 학습 MTLD 하위 25%(67.5 미만)라 1.0 → 0.0은 MTLD를 40% 넘게 줄여야 하고,
+    # 미니 시험에서 내리기 56건 중 3건만 도달했다
+    lower_floor: 0.5
     safety:
       allow:
         # 반복되는 일상어를 정확한 동의어로 바꾼다
@@ -515,14 +523,20 @@ strategies:
         - "Replacing the topic name or domain terms with looser words."
     safety_down:              # 내릴 때(목표 < 현재) safety 대신 Rewriter에 보여 준다(C37)
       allow:
-        # 같은 대상을 여러 동의어 대신 한 단어로 일관되게 부른다
-        - "Use one consistent word for the same thing instead of varying synonyms."
+        # 이미 이름 붙인 대상을 다시 말할 때 같은 단어를 다시 쓴다(v0.11: 원문에 동의어가 없으면 할 일이 없던 문장을 바꿈)
+        - "When the text mentions something it has already named, reuse the same word (e.g., 'records' every time, not 'records', 'documents' and 'files')."
+        # 같은 대상을 같은 단어로 다시 부르는 것은 여기서 자연스러우며 공통 규칙이 금지하는 반복이 아니다(v0.11, 좁힌 예외)
+        - "Reusing the same word for the same thing is natural here and is not the repetition the rules forbid."
       forbid:
         # 뜻이 바뀌는 단어 바꾸기
         - "Word changes that change the meaning."
+        # 새 동의어를 넣거나 문장을 바꿔 쓰기(v0.11: 미니 시험에서 Rewriter가 records → documentation처럼 바꿨다)
+        - "Introducing new synonyms or paraphrasing sentences."
+        # 내용에 필요한 것보다 질의어를 더 반복하기(v0.11: 예외가 키워드 스터핑 통로가 되지 않게)
+        - "Repeating the query's words more than the content needs."
     rewriter_bins:
-      # 같은 단어와 표현이 반복된다
-      0.0: "The same words and phrases are repeated."
+      # 쉽고 일관된 표현: 같은 대상은 늘 같은 단어로 부른다(v0.11: "같은 단어와 표현이 반복된다"가 공통 규칙의 반복 금지와 부딪혔다)
+      0.0: "Plain, consistent wording: each thing is called by the same word every time."
       # 어휘 다양성이 보통이다
       0.5: "Vocabulary variety is average."
       # 같은 대상을 정확하면서도 다양한 표현으로 서술한다
